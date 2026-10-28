@@ -1,66 +1,139 @@
-import React, { useMemo } from "react";
-import { ChartContainer, ChartTooltip } from "@/src/components/ui/chart";
-import { Bar, BarChart, XAxis, YAxis } from "recharts";
+import { useMemo } from "react";
+
+import { StackedBarChart } from "@/src/components/design-system/charts/StackedBarChart/StackedBarChart";
+import type { LineChartLegend } from "@/src/components/design-system/charts/LineChart/LineChart";
 import { type ChartProps } from "@/src/features/widgets/chart-library/chart-props";
 import {
+  formatMetric,
   getUniqueDimensions,
   groupDataByTimeDimension,
+  toFullMetricString,
 } from "@/src/features/widgets/chart-library/utils";
+import {
+  parseChartTimestamp,
+  prepareTimeAxis,
+} from "@/src/features/widgets/chart-library/prepareTimeAxis";
+import { prepareVisibleSeries } from "@/src/features/widgets/chart-library/prepareVisibleSeries";
+import {
+  seriesFillColor,
+  SeriesOverflowNote,
+} from "@/src/features/widgets/chart-library/SeriesOverflowNote";
+import { getPlainTextFromReactNode } from "@/src/utils/react-node-plain-text";
 
-/**
- * VerticalBarChartTimeSeries component
- * @param data - Data to be displayed. Expects an array of objects with time_dimension, dimension, and metric properties.
- * @param config - Configuration object for the chart. Can include theme settings for light and dark modes.
- * @param accessibilityLayer - Boolean to enable or disable the accessibility layer. Default is true.
- */
-export const VerticalBarChartTimeSeries: React.FC<ChartProps> = ({
+export function VerticalBarChartTimeSeries({
   data,
-  config = {
-    metric: {
-      theme: {
-        light: "hsl(var(--chart-1))",
-        dark: "hsl(var(--chart-1))",
-      },
-    },
-  },
-  accessibilityLayer = true,
-}) => {
+  config,
+  metricFormatter = formatMetric,
+  legendPosition = "auto",
+  legendSummary = "none",
+  legendInteraction = "highlight",
+  maxVisibleSeries,
+  sync,
+  hideXAxisLabels = false,
+}: ChartProps) {
   const groupedData = useMemo(() => groupDataByTimeDimension(data), [data]);
   const dimensions = useMemo(() => getUniqueDimensions(data), [data]);
+  const visibleSeries = useMemo(
+    () => prepareVisibleSeries(data, dimensions),
+    [data, dimensions],
+  );
+  const timeAxis = useMemo(
+    () =>
+      prepareTimeAxis(
+        groupedData.map((datum) => datum.time_dimension),
+        undefined,
+        {
+          hideCategoryTickLabels: hideXAxisLabels,
+        },
+      ),
+    [groupedData, hideXAxisLabels],
+  );
+  const formatValue = useMemo(
+    () => (value: number) =>
+      toFullMetricString(metricFormatter(value, { style: "compact" })),
+    [metricFormatter],
+  );
+  const chartData = useMemo(
+    () =>
+      groupedData.map((datum) => ({
+        key: String(datum.time_dimension ?? ""),
+        values: Object.fromEntries(
+          visibleSeries.visible.map((dimension) => [
+            dimension,
+            typeof datum[dimension] === "number" ? datum[dimension] : null,
+          ]),
+        ),
+      })),
+    [groupedData, visibleSeries],
+  );
+  const chartSeries = useMemo(
+    () =>
+      visibleSeries.visible.map((dimension, index) => ({
+        id: dimension,
+        label:
+          getPlainTextFromReactNode(config?.[dimension]?.label ?? dimension) ??
+          dimension,
+        color: seriesFillColor(index),
+      })),
+    [visibleSeries, config],
+  );
+  const chartLegend = useMemo<LineChartLegend>(() => {
+    if (legendPosition === "none") return { visibility: "hidden" };
+    if (legendInteraction === "toggle") {
+      return {
+        visibility: legendPosition === "auto" ? "auto" : "visible",
+        interaction: "toggle",
+        summary: legendSummary,
+        maxVisibleSeries,
+      };
+    }
+    return {
+      visibility: legendPosition === "auto" ? "auto" : "visible",
+      interaction: "highlight",
+      summary: legendSummary,
+    };
+  }, [legendPosition, legendInteraction, legendSummary, maxVisibleSeries]);
 
   return (
-    <ChartContainer config={config}>
-      <BarChart accessibilityLayer={accessibilityLayer} data={groupedData}>
-        <XAxis
-          dataKey="time_dimension"
-          stroke="hsl(var(--chart-grid))"
-          fontSize={12}
-          tickLine={false}
-          axisLine={false}
+    <div className="flex size-full min-w-0 flex-col">
+      {visibleSeries.total > visibleSeries.visible.length ? (
+        <SeriesOverflowNote
+          visibleCount={visibleSeries.visible.length}
+          totalCount={visibleSeries.total}
         />
-        <YAxis
-          type="number"
-          stroke="hsl(var(--chart-grid))"
-          fontSize={12}
-          tickLine={false}
-          axisLine={false}
+      ) : null}
+      <div className="min-h-0 flex-1">
+        <StackedBarChart
+          data={chartData}
+          series={chartSeries}
+          legend={chartLegend}
+          valueFormatter={formatValue}
+          tickFormatter={(key) => timeAxis.formatTick(key)}
+          categoryXAxisLabels={timeAxis.mode === "category"}
+          tooltipFormatter={(key) => timeAxis.formatTooltip(key)}
+          hideXAxisLabels={hideXAxisLabels && timeAxis.mode === "category"}
+          sync={
+            sync
+              ? {
+                  activeKey: chartData.find(
+                    (_, index) =>
+                      String(
+                        parseChartTimestamp(
+                          groupedData[index]?.time_dimension,
+                        )?.getTime() ?? groupedData[index]?.time_dimension,
+                      ) === sync.activeKey,
+                  )?.key,
+                  onActiveKeyChange: (key) =>
+                    sync.onActiveKeyChange(
+                      key === undefined
+                        ? undefined
+                        : String(parseChartTimestamp(key)?.getTime() ?? key),
+                    ),
+                }
+              : undefined
+          }
         />
-        {dimensions.map((dimension, index) => (
-          <Bar
-            key={dimension}
-            dataKey={dimension}
-            stroke={`hsl(var(--chart-${(index % 4) + 1}))`}
-            fill={`hsl(var(--chart-${(index % 4) + 1}))`}
-            // Stack bars if there are multiple dimensions
-            stackId={dimensions.length > 1 ? "stack" : undefined}
-          />
-        ))}
-        <ChartTooltip
-          contentStyle={{ backgroundColor: "hsl(var(--background))" }}
-        />
-      </BarChart>
-    </ChartContainer>
+      </div>
+    </div>
   );
-};
-
-export default VerticalBarChartTimeSeries;
+}

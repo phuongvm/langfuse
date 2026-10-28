@@ -1,11 +1,14 @@
-import { aggregateScores } from "@/src/features/scores/lib/aggregateScores";
-import { filterAndValidateDbScoreList } from "@langfuse/shared";
-import { type GetAllGenerationsInput } from "../getAllQueries";
+import { aggregateScores } from "@/src/features/scores/server";
+import {
+  filterAndValidateDbScoreList,
+  LISTABLE_SCORE_TYPES,
+} from "@langfuse/shared";
 import {
   getObservationsTableWithModelData,
   getScoresForObservations,
   traceException,
 } from "@langfuse/shared/src/server";
+import { type GetAllGenerationsInput } from "../getAllQueries";
 
 export async function getAllGenerations({
   input,
@@ -14,7 +17,7 @@ export async function getAllGenerations({
   input: GetAllGenerationsInput;
   selectIOAndMetadata: boolean;
 }) {
-  const generations = await getObservationsTableWithModelData({
+  const queryOpts = {
     projectId: input.projectId,
     filter: input.filter,
     orderBy: input.orderBy,
@@ -23,17 +26,20 @@ export async function getAllGenerations({
     selectIOAndMetadata: selectIOAndMetadata,
     offset: input.page * input.limit,
     limit: input.limit,
-  });
+  };
+  let generations = await getObservationsTableWithModelData(queryOpts);
 
   const scores = await getScoresForObservations({
     projectId: input.projectId,
     observationIds: generations.map((gen) => gen.id),
     excludeMetadata: true,
     includeHasMetadata: true,
+    preferredClickhouseService: "ReadOnly",
   });
 
   const validatedScores = filterAndValidateDbScoreList({
     scores,
+    dataTypes: LISTABLE_SCORE_TYPES,
     includeHasMetadata: true,
     onParseError: traceException,
   });

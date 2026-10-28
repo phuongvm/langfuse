@@ -1,9 +1,16 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
+import { shouldSkipScoresDedup } from "../queries/clickhouse-sql/query-options";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
 import { OrderByState } from "../../interfaces/orderBy";
 import { sessionCols } from "../tableMappings/mapSessionTable";
 import { FilterState } from "../../types";
-import { convertDateToClickhouseDateTime } from "../clickhouse/client";
-import { measureAndReturn } from "../clickhouse/measureAndReturn";
+import { sessionsViewCols } from "../../tableDefinitions/sessionsView";
+import { findUiColumnMapping } from "../../tableDefinitions";
+import {
+  convertDateToClickhouseDateTime,
+  type PreferredClickhouseService,
+} from "../clickhouse/client";
+import { scoreBooleansAggregation } from "../queries/clickhouse-sql/query-fragments";
 import { DateTimeFilter, FilterList, orderByToClickhouseSql } from "../queries";
 import {
   getProjectIdDefaultFilter,
@@ -12,7 +19,6 @@ import {
 import {
   TRACE_TO_OBSERVATIONS_INTERVAL,
   queryClickhouse,
-  getTimeframesTracesAMT,
 } from "../repositories";
 
 export type SessionDataReturnType = {
@@ -26,6 +32,7 @@ export type SessionDataReturnType = {
   trace_environment?: string;
   scores_avg?: Array<Array<[string, number]>>;
   score_categories?: Array<Array<string>>;
+  score_booleans?: Array<Array<string>>;
 };
 
 export type SessionWithMetricsReturnType = SessionDataReturnType & {
@@ -55,7 +62,6 @@ export const getSessionsTableCount = async (props: {
     orderBy: props.orderBy,
     limit: props.limit,
     page: props.page,
-    tags: { kind: "count" },
   });
 
   return rows.length > 0 ? Number(rows[0].count) : 0;
@@ -75,7 +81,6 @@ export const getSessionsTable = async (props: {
     orderBy: props.orderBy,
     limit: props.limit,
     page: props.page,
-    tags: { kind: "list" },
   });
 
   return rows.map((row) => ({
@@ -91,6 +96,7 @@ export const getSessionsWithMetrics = async (props: {
   limit?: number;
   page?: number;
   clickhouseConfigs?: ClickHouseClientConfigOptions | undefined;
+  preferredClickhouseService?: PreferredClickhouseService;
 }) => {
   const rows = await getSessionsTableGeneric<SessionWithMetricsReturnType>({
     select: "metrics",
@@ -100,7 +106,7 @@ export const getSessionsWithMetrics = async (props: {
     limit: props.limit,
     page: props.page,
     clickhouseConfigs: props.clickhouseConfigs,
-    tags: { kind: "analytic" },
+    preferredClickhouseService: props.preferredClickhouseService,
   });
 
   return rows.map((row) => ({
@@ -120,11 +126,20 @@ export type FetchSessionsTableProps = {
   page?: number;
   tags?: Record<string, string>;
   clickhouseConfigs?: ClickHouseClientConfigOptions | undefined;
+  preferredClickhouseService?: PreferredClickhouseService;
 };
 
 const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
-  const { select, projectId, filter, orderBy, limit, page, clickhouseConfigs } =
-    props;
+  const {
+    select,
+    projectId,
+    filter,
+    orderBy,
+    limit,
+    page,
+    clickhouseConfigs,
+    preferredClickhouseService,
+  } = props;
 
   let sqlSelect: string;
   switch (select) {
@@ -133,23 +148,23 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
       break;
     case "rows":
       sqlSelect = `
-          session_id, 
-          max_timestamp, 
-          min_timestamp, 
-          trace_ids, 
-          user_ids, 
-          trace_count, 
+          session_id,
+          max_timestamp,
+          min_timestamp,
+          trace_ids,
+          user_ids,
+          trace_count,
           trace_tags,
           trace_environment`;
       break;
     case "metrics":
       sqlSelect = `
-        session_id, 
-        max_timestamp, 
-        min_timestamp, 
-        trace_ids, 
-        user_ids, 
-        trace_count, 
+        session_id,
+        max_timestamp,
+        min_timestamp,
+        trace_ids,
+        user_ids,
+        trace_count,
         trace_tags,
         trace_environment,
         total_observations,
@@ -163,7 +178,8 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         session_output_usage,
         session_total_usage,
         scores_avg,
-        score_categories`;
+        score_categories,
+        score_booleans`;
       break;
     default: {
       const exhaustiveCheckDefault: never = select;
@@ -175,7 +191,9 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
     tracesPrefix: "s",
   });
 
-  tracesFilter.push(...createFilterFromFilterState(filter, sessionCols));
+  tracesFilter.push(
+    ...createFilterFromFilterState(filter, sessionCols, sessionsViewCols),
+  );
 
   const tracesFilterRes = tracesFilter
     .filter((f) => f.field !== "environment")
@@ -214,10 +232,8 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
 
   const requiresScoresJoin =
     tracesFilter.find((f) => f.clickhouseTable === "scores") !== undefined ||
-    sessionCols.find(
-      (c) =>
-        c.uiTableName === orderBy?.column || c.uiTableId === orderBy?.column,
-    )?.clickhouseTableName === "scores";
+    findUiColumnMapping(sessionCols, orderBy?.column)?.clickhouseTableName ===
+      "scores";
 
   const hasMetricsFilter =
     tracesFilter.find((f) =>
@@ -231,6 +247,7 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         "session_input_usage",
         "scores_avg",
         "score_categories",
+        "score_booleans",
       ].includes(f.field),
     ) ||
     (orderBy &&
@@ -260,7 +277,8 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
       groupArrayIf(
         concat(name, ':', string_value),
         data_type = 'CATEGORICAL' AND notEmpty(string_value)
-      ) AS score_categories
+      ) AS score_categories,
+      ${scoreBooleansAggregation()} AS score_booleans
     FROM (
       SELECT
         project_id,
@@ -269,8 +287,8 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         data_type,
         string_value,
         avg(value) avg_value
-      FROM scores s FINAL
-      WHERE 
+      FROM scores s ${shouldSkipScoresDedup(projectId) ? "" : "FINAL"}
+      WHERE
         project_id = {projectId: String}
         ${scoresFilterRes ? `AND ${scoresFilterRes.query}` : ""}
       GROUP BY
@@ -279,7 +297,7 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         name,
         data_type,
         string_value
-      ) tmp
+    ) tmp
     GROUP BY
       project_id, session_id
   )`;
@@ -290,13 +308,13 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         deduplicated_traces AS (
           SELECT * EXCEPT input, output, metadata
           FROM __TRACE_TABLE__ t
-          WHERE t.session_id IS NOT NULL 
+          WHERE t.session_id IS NOT NULL
             AND t.project_id = {projectId: String}
             ${singleTraceFilter?.query ? ` AND ${singleTraceFilter.query}` : ""}
             LIMIT 1 BY id, project_id
         ),
         deduplicated_observations AS (
-            SELECT * 
+            SELECT *
             FROM observations o
             WHERE o.project_id = {projectId: String}
             ${traceTimestampFilter ? `AND o.start_time >= {observationsStartTime: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
@@ -344,12 +362,13 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
                       ${
                         select === "metrics" || requiresScoresJoin
                           ? `groupUniqArrayArray(s.scores_avg) as scores_avg,
-                      groupUniqArrayArray(s.score_categories) as score_categories,`
+                      groupUniqArrayArray(s.score_categories) as score_categories,
+                      groupUniqArrayArray(s.score_booleans) as score_booleans,`
                           : ""
                       }
                       arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, sumMap(o.sum_cost_details)))) as session_input_cost,
                       arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, sumMap(o.sum_cost_details)))) as session_output_cost,
-                      sumMap(o.sum_cost_details)['total'] as session_total_cost,          
+                      sumMap(o.sum_cost_details)['total'] as session_total_cost,
                       arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, sumMap(o.sum_usage_details)))) as session_input_usage,
                       arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, sumMap(o.sum_usage_details)))) as session_output_usage,
                       sumMap(o.sum_usage_details)['total'] as session_total_usage`
@@ -375,60 +394,30 @@ const getSessionsTableGeneric = async <T>(props: FetchSessionsTableProps) => {
         ${limit !== undefined && page !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
         `;
 
-  return measureAndReturn({
-    operationName: "getSessionsTableGeneric",
-    projectId,
-    minStartTime: filter?.find(
-      (f) =>
-        f.column === "min_timestamp" &&
-        (f.operator === ">=" || f.operator === ">"),
-    )?.value as Date | undefined,
-    input: {
-      params: {
-        projectId,
-        limit: limit,
-        offset: limit && page ? limit * page : 0,
-        ...tracesFilterRes.params,
-        ...singleTraceFilter?.params,
-        ...scoresFilterRes.params,
-        ...(traceTimestampFilter
-          ? {
-              observationsStartTime: convertDateToClickhouseDateTime(
-                traceTimestampFilter.value,
-              ),
-            }
-          : {}),
-      },
-      tags: {
-        ...(props.tags ?? {}),
-        feature: "tracing",
-        type: "sessions-table",
-        projectId,
-        operation_name: `getSessionsTableGeneric-${select}`,
-      },
+  const input = {
+    params: {
+      projectId,
+      limit: limit,
+      offset: limit && page ? limit * page : 0,
+      ...tracesFilterRes.params,
+      ...singleTraceFilter?.params,
+      ...scoresFilterRes.params,
+      ...(traceTimestampFilter
+        ? {
+            observationsStartTime: convertDateToClickhouseDateTime(
+              traceTimestampFilter.value,
+            ),
+          }
+        : {}),
     },
-    existingExecution: async (input) => {
-      return queryClickhouse<T>({
-        query: query.replace("__TRACE_TABLE__", "traces"),
-        params: input.params,
-        tags: { ...input.tags, experiment_amt: "original" },
-        clickhouseConfigs,
-      });
-    },
-    newExecution: async (input) => {
-      // Extract the timestamp from filter for AMT table selection
-      const fromTimestamp = filter?.find(
-        (f) =>
-          f.column === "min_timestamp" &&
-          (f.operator === ">=" || f.operator === ">"),
-      )?.value as Date | undefined;
-      const traceAmt = getTimeframesTracesAMT(fromTimestamp);
-      return queryClickhouse<T>({
-        query: query.replace("__TRACE_TABLE__", traceAmt),
-        params: input.params,
-        tags: { ...input.tags, experiment_amt: "new" },
-        clickhouseConfigs,
-      });
-    },
+    tags: { ...(props.tags ?? {}), projectId },
+  };
+
+  return queryClickhouse<T>({
+    query: query.replace("__TRACE_TABLE__", "traces"),
+    params: input.params,
+    tags: input.tags,
+    clickhouseConfigs,
+    preferredClickhouseService,
   });
 };

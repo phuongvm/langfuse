@@ -1,22 +1,14 @@
 import { Card } from "@/src/components/ui/card";
-import {
-  ResizableHandle,
-  ResizablePanel,
-  ResizablePanelGroup,
-} from "@/src/components/ui/resizable";
-import useSessionStorage from "@/src/components/useSessionStorage";
-import { AnnotateDrawerContent } from "@/src/features/scores/components/AnnotateDrawerContent";
-import { type ScoreTarget } from "@/src/features/scores/types";
+import { AnnotationForm, type ScoreTarget } from "@/src/features/scores";
 import {
   type AnnotationQueueItem,
-  type APIScoreV2,
+  type ScoreDomain,
   isPresent,
-  type ValidatedScoreConfig,
+  type ScoreConfigDomain,
 } from "@langfuse/shared";
-import { TriangleAlertIcon } from "lucide-react";
+import { TriangleAlertIcon } from "@langfuse/icons";
 import { useSession } from "next-auth/react";
-import { useMemo, useState } from "react";
-import { CommentsSection } from "./CommentsSection";
+import { type WithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 
 interface AnnotationDrawerSectionProps {
   item: AnnotationQueueItem & {
@@ -24,92 +16,60 @@ interface AnnotationDrawerSectionProps {
     lockedByUser: { name: string | null | undefined } | null;
   };
   scoreTarget: ScoreTarget;
-  scores: APIScoreV2[];
-  configs: ValidatedScoreConfig[];
+  scores: WithStringifiedMetadata<ScoreDomain>[];
+  configs: ScoreConfigDomain[];
   environment?: string;
-  onHasCommentDraftChange?: (hasDraft: boolean) => void;
+  isV4: boolean;
 }
 
 export const AnnotationDrawerSection: React.FC<
   AnnotationDrawerSectionProps
-> = ({
-  item,
-  scoreTarget,
-  scores,
-  configs,
-  environment,
-  onHasCommentDraftChange,
-}) => {
+> = ({ item, scoreTarget, scores, configs, environment, isV4 }) => {
   const session = useSession();
-  const [showSaving, setShowSaving] = useState(false);
-  const [verticalSize, setVerticalSize] = useSessionStorage(
-    `annotationQueueDrawerVertical-${item.projectId}`,
-    60,
-  );
 
   const isLockedByOtherUser = item.lockedByUserId !== session.data?.user?.id;
 
-  const emptySelectedConfigIds = useMemo(() => {
-    return configs.map((c) => c.id);
-  }, [configs]);
-
-  const handleSavingChange = (saving: boolean) => {
-    setShowSaving(saving);
-  };
+  const hasNonAnnotationScores = scores.some(
+    (score) => score.source !== "ANNOTATION",
+  );
 
   return (
-    <Card className="col-span-2 flex h-full flex-col overflow-hidden">
-      <ResizablePanelGroup
-        direction="vertical"
-        onLayout={(sizes) => setVerticalSize(sizes[0])}
-      >
-        <ResizablePanel
-          className="w-full overflow-y-auto"
-          minSize={30}
-          defaultSize={verticalSize}
-        >
-          <AnnotateDrawerContent
-            key={"annotation-drawer-content" + item.objectId}
-            scoreTarget={scoreTarget}
-            scores={scores}
-            configs={configs}
-            emptySelectedConfigIds={emptySelectedConfigIds}
-            setEmptySelectedConfigIds={() => {}}
-            projectId={item.projectId}
-            analyticsData={{
-              type: scoreTarget.type,
-              source: "AnnotationQueue",
-            }}
-            isSelectHidden
-            queueId={item.queueId}
-            showSaving={showSaving}
-            setShowSaving={handleSavingChange}
-            environment={environment}
-            actionButtons={
-              isLockedByOtherUser && isPresent(item.lockedByUser?.name) ? (
-                <div className="flex items-center justify-center rounded-sm border border-dark-red bg-light-red p-1">
-                  <TriangleAlertIcon className="mr-1 h-4 w-4 text-dark-red" />
-                  <span className="text-xs text-dark-red">
-                    Currently edited by {item.lockedByUser.name}
-                  </span>
-                </div>
-              ) : undefined
-            }
-            isDrawerOpen={true}
-          />
-        </ResizablePanel>
-        <ResizableHandle withHandle />
-        <ResizablePanel className="overflow-y-auto" minSize={20}>
-          <CommentsSection
-            projectId={item.projectId}
-            objectId={item.objectId}
-            objectType={item.objectType}
-            onDraftChange={(draft) => {
-              onHasCommentDraftChange?.(draft);
-            }}
-          />
-        </ResizablePanel>
-      </ResizablePanelGroup>
+    <Card className="col-span-2 flex h-full flex-col overflow-y-auto border-none p-3 [--annotation-surface:var(--card)]">
+      <AnnotationForm
+        key={"annotation-drawer-content" + item.objectId}
+        scoreTarget={scoreTarget}
+        serverScores={scores}
+        configSelection={{ mode: "fixed", configs }}
+        scoreMetadata={{
+          projectId: item.projectId,
+          queueId: item.queueId,
+          environment,
+        }}
+        analyticsData={{
+          type: scoreTarget.type,
+          source: "AnnotationQueue",
+          isV4,
+        }}
+        actionButtons={
+          isLockedByOtherUser && isPresent(item.lockedByUser?.name) ? (
+            <div className="border-dark-red bg-light-red flex items-center justify-center rounded-sm border p-1">
+              <TriangleAlertIcon
+                size="base"
+                __rawClassName="text-dark-red mr-1"
+              />
+              <span className="text-dark-red text-xs">
+                Currently edited by {item.lockedByUser.name}
+              </span>
+            </div>
+          ) : undefined
+        }
+      />
+      {hasNonAnnotationScores && (
+        <div className="text-muted-foreground mt-4 text-xs">
+          API and eval scores visible when toggling on the detailed view. Add
+          manual annotations above.
+        </div>
+      )}
     </Card>
   );
 };

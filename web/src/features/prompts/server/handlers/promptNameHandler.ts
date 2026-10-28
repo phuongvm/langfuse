@@ -1,54 +1,76 @@
-import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
 
-import { getPromptByName } from "@/src/features/prompts/server/actions/getPromptByName";
-import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { authorizePromptRequestOrThrow } from "../utils/authorizePromptRequest";
+import {
+  deletePromptForApi,
+  getPromptForApi,
+} from "@/src/features/prompts/server/prompt-api-service";
+import {
+  withMiddlewares,
+  createAuthedProjectAPIRoute,
+} from "@/src/features/public-api/server";
 import {
   GetPromptByNameSchema,
   LangfuseNotFoundError,
   PRODUCTION_LABEL,
 } from "@langfuse/shared";
-import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
-
-const getPromptNameHandler = async (
-  req: NextApiRequest,
-  res: NextApiResponse,
-) => {
-  const authCheck = await authorizePromptRequestOrThrow(req);
-
-  const rateLimitCheck = await RateLimitService.getInstance().rateLimitRequest(
-    authCheck.scope,
-    "prompts",
-  );
-
-  if (rateLimitCheck?.isRateLimited()) {
-    return rateLimitCheck.sendRestResponseIfLimited(res);
-  }
-
-  const { promptName, version, label } = GetPromptByNameSchema.parse(req.query);
-
-  const prompt = await getPromptByName({
-    promptName: promptName,
-    projectId: authCheck.scope.projectId,
-    version,
-    label,
-  });
-
-  if (!prompt) {
-    let errorMessage = `Prompt not found: '${promptName}'`;
-
-    if (version) {
-      errorMessage += ` with version ${version}`;
-    } else {
-      errorMessage += ` with label '${label ?? PRODUCTION_LABEL}'`;
-    }
-
-    throw new LangfuseNotFoundError(errorMessage);
-  }
-
-  return res.status(200).json(prompt);
-};
 
 export const promptNameHandler = withMiddlewares({
-  GET: getPromptNameHandler,
+  GET: createAuthedProjectAPIRoute({
+    name: "Get Prompt",
+    action: "prompts:read",
+    querySchema: GetPromptByNameSchema,
+    responseSchema: z.any(),
+    allowInAppAgentKey: true,
+    isAdminApiKeyAuthAllowed: false,
+    rateLimitResource: "prompts",
+    fn: async ({ query, auth }) => {
+      const { promptName, version, label, resolve } = query;
+
+      const prompt = await getPromptForApi({
+        promptName,
+        projectId: auth.scope.projectId,
+        version,
+        label,
+        resolve,
+      });
+
+      if (!prompt) {
+        let errorMessage = `Prompt not found: '${promptName}'`;
+
+        if (version) {
+          errorMessage += ` with version ${version}`;
+        } else {
+          errorMessage += ` with label '${label ?? PRODUCTION_LABEL}'`;
+        }
+
+        throw new LangfuseNotFoundError(errorMessage);
+      }
+
+      return {
+        ...prompt,
+        isActive: prompt.labels.includes(PRODUCTION_LABEL),
+      };
+    },
+  }),
+  DELETE: createAuthedProjectAPIRoute({
+    name: "Delete Prompt",
+    action: "prompts:CUD",
+    querySchema: GetPromptByNameSchema,
+    responseSchema: z.void(),
+    successStatusCode: 204,
+    allowInAppAgentKey: true,
+    isAdminApiKeyAuthAllowed: false,
+    rateLimitResource: "prompts",
+    fn: async ({ query, auth, ctx }) => {
+      const { promptName, version, label } = query;
+
+      await deletePromptForApi({
+        context: auth.scope,
+        promptName,
+        version,
+        label,
+        ctx,
+      });
+    },
+  }),
 });

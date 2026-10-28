@@ -1,10 +1,10 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type PlaygroundHandle,
   type WindowCoordinationReturn,
   PLAYGROUND_EVENTS,
 } from "../types";
-import { showErrorToast } from "@/src/features/notifications/showErrorToast";
+import { showErrorToast } from "@/src/features/notifications";
 
 /**
  * Playground window registry for coordinating actions across multiple playground windows
@@ -34,7 +34,20 @@ const playgroundEventBus = new EventTarget();
  */
 export const useWindowCoordination = (): WindowCoordinationReturn => {
   const [isExecutingAll, setIsExecutingAll] = useState(false);
+  const [hasAnyModelConfigured, setHasAnyModelConfigured] = useState(false);
   const executionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  /**
+   * Check if any registered window has a model configured
+   * Updates the hasAnyModelConfigured state
+   */
+  const checkModelConfiguration = useCallback(() => {
+    const registeredWindows = Array.from(playgroundWindowRegistry.values());
+    const hasModel = registeredWindows.some((handle) =>
+      handle.hasModelConfigured(),
+    );
+    setHasAnyModelConfigured(hasModel);
+  }, []);
 
   /**
    * Register a playground window with the global coordination system
@@ -47,6 +60,9 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
     (windowId: string, handle: PlaygroundHandle) => {
       playgroundWindowRegistry.set(windowId, handle);
 
+      // Check model configuration after registration
+      checkModelConfiguration();
+
       // Dispatch registration event for potential listeners
       playgroundEventBus.dispatchEvent(
         new CustomEvent(PLAYGROUND_EVENTS.WINDOW_REGISTERED, {
@@ -54,7 +70,7 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
         }),
       );
     },
-    [],
+    [checkModelConfiguration],
   );
 
   /**
@@ -63,19 +79,25 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
    *
    * @param windowId - Unique identifier for the window to remove
    */
-  const unregisterWindow = useCallback((windowId: string) => {
-    const wasRegistered = playgroundWindowRegistry.has(windowId);
-    playgroundWindowRegistry.delete(windowId);
+  const unregisterWindow = useCallback(
+    (windowId: string) => {
+      const wasRegistered = playgroundWindowRegistry.has(windowId);
+      playgroundWindowRegistry.delete(windowId);
 
-    if (wasRegistered) {
-      // Dispatch unregistration event for potential listeners
-      playgroundEventBus.dispatchEvent(
-        new CustomEvent(PLAYGROUND_EVENTS.WINDOW_UNREGISTERED, {
-          detail: { windowId },
-        }),
-      );
-    }
-  }, []);
+      if (wasRegistered) {
+        // Check model configuration after unregistration
+        checkModelConfiguration();
+
+        // Dispatch unregistration event for potential listeners
+        playgroundEventBus.dispatchEvent(
+          new CustomEvent(PLAYGROUND_EVENTS.WINDOW_UNREGISTERED, {
+            detail: { windowId },
+          }),
+        );
+      }
+    },
+    [checkModelConfiguration],
+  );
 
   /**
    * Execute all registered playground windows in parallel
@@ -96,6 +118,15 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
       return;
     }
 
+    // Check if any window has a model configured
+    const hasModel = registeredWindows.some((handle) =>
+      handle.hasModelConfigured(),
+    );
+    if (!hasModel) {
+      // Don't show error toast - the UI already shows a clear alert banner
+      return;
+    }
+
     // Dispatch execute-all event first
     playgroundEventBus.dispatchEvent(
       new CustomEvent(PLAYGROUND_EVENTS.EXECUTE_ALL),
@@ -112,6 +143,11 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
         showErrorToast(
           "No content to execute",
           "Please add at least one message with content to any window.",
+          {
+            operation: "playground.execute",
+            errorOrigin: "frontend",
+            errorCategory: "user_input",
+          },
         );
         setIsExecutingAll(false);
       } else {
@@ -201,6 +237,25 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
     return `Executing ${executingCount} of ${totalCount} windows`;
   }, []);
 
+  // Listen for model configuration changes
+  useEffect(() => {
+    const handleModelConfigChange = () => {
+      checkModelConfiguration();
+    };
+
+    playgroundEventBus.addEventListener(
+      PLAYGROUND_EVENTS.WINDOW_MODEL_CONFIG_CHANGE,
+      handleModelConfigChange,
+    );
+
+    return () => {
+      playgroundEventBus.removeEventListener(
+        PLAYGROUND_EVENTS.WINDOW_MODEL_CONFIG_CHANGE,
+        handleModelConfigChange,
+      );
+    };
+  }, [checkModelConfiguration]);
+
   return {
     registerWindow,
     unregisterWindow,
@@ -208,20 +263,8 @@ export const useWindowCoordination = (): WindowCoordinationReturn => {
     stopAllWindows,
     getExecutionStatus,
     isExecutingAll,
+    hasAnyModelConfigured,
   };
-};
-
-/**
- * Utility function to get the current playground window registry
- * Useful for debugging and testing purposes
- *
- * @returns Map of windowId to PlaygroundHandle
- */
-export const getPlaygroundWindowRegistry = (): Map<
-  string,
-  PlaygroundHandle
-> => {
-  return playgroundWindowRegistry;
 };
 
 /**
@@ -232,14 +275,4 @@ export const getPlaygroundWindowRegistry = (): Map<
  */
 export const getPlaygroundEventBus = (): EventTarget => {
   return playgroundEventBus;
-};
-
-/**
- * Utility function to get the current window count
- * Useful for UI components that need to display window statistics
- *
- * @returns Number of currently registered windows
- */
-export const getWindowCount = (): number => {
-  return playgroundWindowRegistry.size;
 };

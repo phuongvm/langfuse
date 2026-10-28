@@ -1,19 +1,26 @@
+/* eslint-disable no-nested-ternary, react/no-unstable-nested-components */
 import { DataTable } from "@/src/components/table/data-table";
-import TableLink from "@/src/components/table/table-link";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
+import { createLinkTableColumn } from "@/src/components/design-system/table/columns/createLinkTableColumn";
 import { api } from "@/src/utils/api";
 import { formatIntervalSeconds } from "@/src/utils/dates";
+import { usdFormatter } from "@/src/utils/numbers";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
-import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
+import {
+  useColumnOrder,
+  useColumnVisibility,
+} from "@/src/features/column-visibility";
 import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
-import { useDetailPageLists } from "@/src/features/navigate-detail-pages/context";
+import { useDetailPageLists } from "@/src/features/navigate-detail-pages";
 import { useEffect, useMemo } from "react";
-import { useRowHeightLocalStorage } from "@/src/components/table/data-table-row-height-switch";
-import { ListTree } from "lucide-react";
-import { useScoreColumns } from "@/src/features/scores/hooks/useScoreColumns";
-import useColumnOrder from "@/src/features/column-visibility/hooks/useColumnOrder";
+import {
+  customRowHeightMenu,
+  isCompactRowHeight,
+  useRowHeightLocalStorage,
+} from "@/src/components/table/data-table-row-height-switch";
+import { ListTree } from "@langfuse/icons";
+import { scoreFilters, useScoreColumns } from "@/src/features/scores";
 import { Skeleton } from "@/src/components/ui/skeleton";
-import { scoreFilters } from "@/src/features/scores/lib/scoreColumns";
 import {
   DatasetItemIOCell,
   TraceObservationIOCell,
@@ -21,38 +28,51 @@ import {
 import { datasetRunItemsTableColsWithOptions } from "@langfuse/shared";
 import { convertRunItemToItemsByRunUiTableRow } from "@/src/features/datasets/lib/convertRunItemDataToUiTableRow";
 import { type DatasetRunItemByRunRowData } from "@/src/features/datasets/lib/types";
-import { LocalIsoDate } from "@/src/components/LocalIsoDate";
-import { useQueryFilterState } from "@/src/features/filters/hooks/useFilterState";
+import { createDateTableColumn } from "@/src/components/design-system/table/columns/createDateTableColumn";
+import { createNumberTableColumn } from "@/src/components/design-system/table/columns/createNumberTableColumn";
+import { useQueryFilterState } from "@/src/features/filters";
 import { useDebounce } from "@/src/hooks/useDebounce";
 
 export function DatasetRunItemsByRunTable(props: {
   projectId: string;
   datasetId: string;
   datasetRunId: string;
+  datasetVersion?: Date | null;
 }) {
+  const { projectId, datasetId, datasetRunId, datasetVersion } = props;
   const { setDetailPageList } = useDetailPageLists();
   const [paginationState, setPaginationState] = useQueryParams({
     pageIndex: withDefault(NumberParam, 0),
     pageSize: withDefault(NumberParam, 20),
   });
 
-  const [rowHeight, setRowHeight] = useRowHeightLocalStorage("traces", "m");
+  const [rowHeight, setRowHeight, rowHeights] = useRowHeightLocalStorage(
+    "traces",
+    "m",
+  );
+  const compactRows = isCompactRowHeight(
+    rowHeight,
+    rowHeights.mode,
+    rowHeights.activeHeightPx,
+  );
 
   const [userFilterState, setUserFilterState] = useQueryFilterState(
     [],
     "dataset_run_items_by_run",
-    props.projectId,
+    projectId,
   );
 
   const datasetRunItemsFilterOptionsResponse =
     api.datasets.runItemFilterOptions.useQuery({
-      projectId: props.projectId,
-      datasetId: props.datasetId,
-      datasetRunId: props.datasetRunId,
+      projectId,
+      datasetId,
+      datasetRunIds: [datasetRunId],
     });
 
   const runItems = api.datasets.runItemsByRunId.useQuery({
-    ...props,
+    projectId,
+    datasetId,
+    datasetRunId,
     page: paginationState.pageIndex,
     limit: paginationState.pageSize,
     filter: userFilterState,
@@ -85,66 +105,69 @@ export function DatasetRunItemsByRunTable(props: {
 
   const { scoreColumns, isLoading: isColumnLoading } =
     useScoreColumns<DatasetRunItemByRunRowData>({
-      projectId: props.projectId,
+      projectId,
       scoreColumnKey: "scores",
       filter: scoreFilters.forDatasetRunItems({
-        datasetRunIds: [props.datasetRunId],
-        datasetId: props.datasetId,
+        datasetRunIds: [datasetRunId],
+        datasetId,
       }),
     });
 
   const columns: LangfuseColumnDef<DatasetRunItemByRunRowData>[] = [
-    {
+    createLinkTableColumn<DatasetRunItemByRunRowData>({
       accessorKey: "datasetItemId",
       header: "Dataset Item",
-      id: "datasetItemId",
       size: 110,
       isPinnedLeft: true,
-      cell: ({ row }) => {
-        const datasetItemId: string = row.getValue("datasetItemId");
-        return (
-          <TableLink
-            path={`/project/${props.projectId}/datasets/${props.datasetId}/items/${datasetItemId}`}
-            value={datasetItemId}
-          />
-        );
+      getCell: (datasetItemId) => {
+        if (!datasetItemId) return undefined;
+        let versionParam = "";
+        if (datasetVersion) {
+          versionParam = `?version=${datasetVersion.toISOString()}`;
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/datasets/${datasetId}/items/${encodeURIComponent(datasetItemId)}${versionParam}`,
+            value: datasetItemId,
+          },
+        };
       },
-    },
-    {
+    }),
+    createDateTableColumn<DatasetRunItemByRunRowData>({
       accessorKey: "runAt",
       header: "Run At",
-      id: "runAt",
       size: 150,
-      cell: ({ row }) => {
-        const value: DatasetRunItemByRunRowData["runAt"] =
-          row.getValue("runAt");
-        return <LocalIsoDate date={value} />;
-      },
-    },
-    {
+    }),
+    createLinkTableColumn<
+      DatasetRunItemByRunRowData,
+      DatasetRunItemByRunRowData["trace"]
+    >({
       accessorKey: "trace",
       header: "Trace",
-      id: "trace",
       size: 60,
-      cell: ({ row }) => {
-        const trace: DatasetRunItemByRunRowData["trace"] =
-          row.getValue("trace");
-        if (!trace) return null;
-        return trace.observationId ? (
-          <TableLink
-            path={`/project/${props.projectId}/traces/${encodeURIComponent(trace.traceId)}?observation=${encodeURIComponent(trace.observationId)}`}
-            value={`Trace: ${trace.traceId}, Observation: ${trace.observationId}`}
-            icon={<ListTree className="h-4 w-4" />}
-          />
-        ) : (
-          <TableLink
-            path={`/project/${props.projectId}/traces/${encodeURIComponent(trace.traceId)}`}
-            value={`Trace: ${trace.traceId}`}
-            icon={<ListTree className="h-4 w-4" />}
-          />
-        );
+      getCell: (trace) => {
+        if (!trace) return undefined;
+        if (trace.observationId) {
+          return {
+            type: "link",
+            props: {
+              path: `/project/${projectId}/traces/${encodeURIComponent(trace.traceId)}?observation=${encodeURIComponent(trace.observationId)}`,
+              value: `Trace: ${trace.traceId}, Observation: ${trace.observationId}`,
+              icon: ListTree,
+            },
+          };
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/traces/${encodeURIComponent(trace.traceId)}`,
+            value: `Trace: ${trace.traceId}`,
+            icon: ListTree,
+          },
+        };
       },
-    },
+    }),
     {
       accessorKey: "latency",
       header: "Latency",
@@ -154,21 +177,16 @@ export function DatasetRunItemsByRunTable(props: {
       cell: ({ row }) => {
         const latency: DatasetRunItemByRunRowData["latency"] =
           row.getValue("latency");
-        return <>{!!latency ? formatIntervalSeconds(latency) : null}</>;
+        return !!latency ? formatIntervalSeconds(latency) : null;
       },
     },
-    {
+    createNumberTableColumn<DatasetRunItemByRunRowData>({
       accessorKey: "totalCost",
       header: "Cost",
-      id: "totalCost",
       size: 60,
       enableHiding: true,
-      cell: ({ row }) => {
-        const totalCost: DatasetRunItemByRunRowData["totalCost"] =
-          row.getValue("totalCost");
-        return <>{totalCost}</>;
-      },
-    },
+      formatter: (value) => usdFormatter(value),
+    }),
     {
       accessorKey: "scores",
       header: "Scores",
@@ -186,6 +204,7 @@ export function DatasetRunItemsByRunTable(props: {
       id: "input",
       size: 200,
       enableHiding: true,
+      cellBackground: "gray",
       cell: ({ row }) => {
         const trace: DatasetRunItemByRunRowData["trace"] =
           row.getValue("trace");
@@ -194,11 +213,11 @@ export function DatasetRunItemsByRunTable(props: {
         return trace ? (
           <TraceObservationIOCell
             traceId={trace.traceId}
-            projectId={props.projectId}
+            projectId={projectId}
             observationId={trace.observationId}
             io="input"
             fromTimestamp={runAt}
-            singleLine={rowHeight === "s"}
+            singleLine={compactRows}
           />
         ) : null;
       },
@@ -209,6 +228,7 @@ export function DatasetRunItemsByRunTable(props: {
       id: "output",
       size: 200,
       enableHiding: true,
+      cellBackground: "green",
       cell: ({ row }) => {
         const trace: DatasetRunItemByRunRowData["trace"] =
           row.getValue("trace");
@@ -217,11 +237,11 @@ export function DatasetRunItemsByRunTable(props: {
         return trace ? (
           <TraceObservationIOCell
             traceId={trace.traceId}
-            projectId={props.projectId}
+            projectId={projectId}
             observationId={trace.observationId}
             io="output"
             fromTimestamp={runAt}
-            singleLine={rowHeight === "s"}
+            singleLine={compactRows}
           />
         ) : null;
       },
@@ -232,15 +252,17 @@ export function DatasetRunItemsByRunTable(props: {
       id: "expectedOutput",
       size: 200,
       enableHiding: true,
+      cellBackground: "green",
       cell: ({ row }) => {
         const datasetItemId: string = row.getValue("datasetItemId");
         return datasetItemId ? (
           <DatasetItemIOCell
-            projectId={props.projectId}
-            datasetId={props.datasetId}
+            projectId={projectId}
+            datasetId={datasetId}
             datasetItemId={datasetItemId}
+            datasetItemVersion={row.original.datasetItemVersion}
             io="expectedOutput"
-            singleLine={rowHeight === "s"}
+            singleLine={compactRows}
           />
         ) : null;
       },
@@ -249,7 +271,7 @@ export function DatasetRunItemsByRunTable(props: {
 
   const [columnVisibility, setColumnVisibility] =
     useColumnVisibility<DatasetRunItemByRunRowData>(
-      `datasetRunsItemsColumnVisibility-${props.projectId}`,
+      `datasetRunsItemsColumnVisibility-${projectId}`,
       columns,
     );
 
@@ -271,6 +293,7 @@ export function DatasetRunItemsByRunTable(props: {
     <>
       <DataTableToolbar
         columns={columns}
+        tableName="dataset-run-items"
         filterColumnDefinition={transformedFilterOptions}
         filterState={userFilterState}
         setFilterState={setFilterState}
@@ -280,9 +303,10 @@ export function DatasetRunItemsByRunTable(props: {
         setColumnOrder={setColumnOrder}
         rowHeight={rowHeight}
         setRowHeight={setRowHeight}
+        customRowHeight={customRowHeightMenu(rowHeights)}
       />
       <DataTable
-        tableName={"datasetRunItems"}
+        tableName="datasetRunItems"
         columns={columns}
         data={
           runItems.isLoading
@@ -309,6 +333,9 @@ export function DatasetRunItemsByRunTable(props: {
         columnOrder={columnOrder}
         onColumnOrderChange={setColumnOrder}
         rowHeight={rowHeight}
+        customRowHeightPx={rowHeights.activeHeightPx}
+        onCustomRowHeightChange={rowHeights.setCustomPx}
+        onSelectRowHeight={setRowHeight}
       />
     </>
   );

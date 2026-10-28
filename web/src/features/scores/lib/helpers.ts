@@ -1,21 +1,25 @@
 import { type ScoreData } from "./types";
 import {
-  ScoreDataType,
+  type ScoreDataTypeType,
   type ScoreTargetTrace,
   type ScoreTarget,
   type ScoreTargetSession,
+  ScoreDataTypeEnum,
 } from "@langfuse/shared";
 
-export const isNumericDataType = (dataType: ScoreDataType) =>
-  dataType === ScoreDataType.NUMERIC;
+export const isNumericDataType = (dataType: ScoreDataTypeType) =>
+  dataType === ScoreDataTypeEnum.NUMERIC;
 
-export const isCategoricalDataType = (dataType: ScoreDataType) =>
-  dataType === ScoreDataType.CATEGORICAL;
+export const isCategoricalDataType = (dataType: ScoreDataTypeType) =>
+  dataType === ScoreDataTypeEnum.CATEGORICAL;
 
-export const isBooleanDataType = (dataType: ScoreDataType) =>
-  dataType === ScoreDataType.BOOLEAN;
+export const isBooleanDataType = (dataType: ScoreDataTypeType) =>
+  dataType === ScoreDataTypeEnum.BOOLEAN;
 
-export const isScoreUnsaved = (scoreId?: string): boolean => !scoreId;
+export const isTextDataType = (dataType: ScoreDataTypeType) =>
+  dataType === ScoreDataTypeEnum.TEXT;
+
+export const isScoreUnsaved = (scoreId?: string | null): boolean => !scoreId;
 
 export const toOrderedScoresList = (list: ScoreData[]): ScoreData[] =>
   list.sort((a, b) => a.key.localeCompare(b.key));
@@ -37,3 +41,13 @@ export const formatAnnotateDescription = <Target extends ScoreTarget>(
   }
   return `Annotate ${sourceEntity} with scores to capture human evaluation across different dimensions.`;
 };
+
+export function formatScoreRange(
+  min: number | null | undefined,
+  max: number | null | undefined,
+) {
+  if (min != null && max != null) return `${min} – ${max}`;
+  if (min != null) return `Min ${min}`;
+  if (max != null) return `Max ${max}`;
+  return "Enter a number";
+}

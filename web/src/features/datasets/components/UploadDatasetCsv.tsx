@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
 import {
   Card,
   CardContent,
@@ -5,16 +6,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/card";
-import { Input } from "@/src/components/ui/input";
-import { UploadIcon } from "lucide-react";
-import { useRef } from "react";
-import { showErrorToast } from "@/src/features/notifications/showErrorToast";
-import { z } from "zod/v4";
-import {
-  type CsvPreviewResult,
-  parseCsvClient,
-} from "@/src/features/datasets/lib/csvHelpers";
+import { showErrorToast } from "@/src/features/notifications";
+import { z } from "zod";
+import { parseCsvClient } from "@/src/features/datasets/lib/csv/helpers";
 import { DialogBody } from "@/src/components/ui/dialog";
+import { Dropzone } from "@/src/components/design-system/Dropzone/Dropzone";
+import type { CsvPreviewResult } from "@/src/features/datasets/lib/csv/types";
 
 export const MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1 * 10; // 10MB
 const ACCEPTED_FILE_TYPES = ["text/csv"] as const;
@@ -31,24 +28,26 @@ export const UploadDatasetCsv = ({
   setPreview: (preview: CsvPreviewResult | null) => void;
   setCsvFile: (file: File | null) => void;
 }) => {
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleFileSelect = async (
-    event: React.ChangeEvent<HTMLInputElement>,
-  ) => {
-    const file = event.target.files?.[0];
+  const handleFiles = async (files: File[]) => {
+    const file = files[0];
     if (!file) return;
 
     const result = FileSchema.safeParse(file);
     if (!result.success) {
-      showErrorToast("Invalid file type", "Please select a valid CSV file");
-      event.target.value = "";
+      showErrorToast("Invalid file type", "Please select a valid CSV file", {
+        operation: "dataset_items.import",
+        errorOrigin: "frontend",
+        errorCategory: "user_input",
+      });
       return;
     }
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      showErrorToast("File too large", "Maximum file size is 10MB");
-      event.target.value = "";
+      showErrorToast("File too large", "Maximum file size is 10MB", {
+        operation: "dataset_items.import",
+        errorOrigin: "frontend",
+        errorCategory: "resource_limit",
+      });
       return;
     }
 
@@ -60,8 +59,11 @@ export const UploadDatasetCsv = ({
       });
 
       if (!Boolean(preview.columns.length)) {
-        showErrorToast("Invalid CSV", "CSV must have at least 1 column");
-        event.target.value = "";
+        showErrorToast("Invalid CSV", "CSV must have at least 1 column", {
+          operation: "dataset_items.import",
+          errorOrigin: "frontend",
+          errorCategory: "user_input",
+        });
         return;
       }
 
@@ -70,9 +72,12 @@ export const UploadDatasetCsv = ({
       showErrorToast(
         "Failed to parse CSV",
         error instanceof Error ? error.message : "Unknown error",
+        {
+          operation: "dataset_items.import",
+          errorOrigin: "frontend",
+          errorCategory: "user_input",
+        },
       );
-    } finally {
-      event.target.value = "";
     }
   };
 
@@ -87,25 +92,17 @@ export const UploadDatasetCsv = ({
           </CardDescription>
         </CardHeader>
         <CardContent>
-          {/* Hidden file input */}
-          <Input
-            type="file"
-            ref={fileInputRef}
-            className="hidden"
-            accept=".csv"
-            onChange={handleFileSelect}
+          <Dropzone
+            onDrop={handleFiles}
+            accept={{ "text/csv": [".csv"] }}
+            isDisabled={false}
+            maxFiles={1}
+            maxSize={MAX_FILE_SIZE_BYTES}
+            minSize={undefined}
+            onError={undefined}
+            src={undefined}
+            variant="panel"
           />
-
-          {/* Clickable upload area */}
-          <div
-            className="flex max-h-full min-h-0 w-full cursor-pointer flex-col items-center justify-center gap-2 overflow-y-auto rounded-lg border border-dashed bg-secondary/50 p-4"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <UploadIcon className="h-6 w-6 text-secondary-foreground" />
-            <div className="text-sm text-secondary-foreground">
-              Click to select a CSV file
-            </div>
-          </div>
         </CardContent>
       </Card>
     </DialogBody>

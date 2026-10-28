@@ -4,6 +4,12 @@ import { ColumnDefinition, SingleValueOption } from "./types";
 
 export const promptsTableCols: ColumnDefinition[] = [
   {
+    name: "ID",
+    id: "id",
+    type: "string",
+    internal: 'p."id"',
+  },
+  {
     name: "Name",
     id: "name",
     type: "string",
@@ -13,6 +19,7 @@ export const promptsTableCols: ColumnDefinition[] = [
     name: "Version",
     id: "version",
     type: "number",
+    step: 1,
     internal: 'p."version"',
   },
   {
@@ -75,6 +82,10 @@ export function promptsTableColsWithOptions(
   });
 }
 
-export function webhookActionFilterOptions(): ColumnDefinition[] {
-  return promptsTableCols.filter((col) => col.id === "name");
+export function webhookActionFilterOptions(
+  options?: PromptOptions,
+): ColumnDefinition[] {
+  return promptsTableColsWithOptions(options).filter((col) =>
+    ["name", "labels", "tags"].includes(col.id),
+  );
 }

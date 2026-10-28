@@ -1,45 +1,49 @@
+/* eslint-disable no-nested-ternary */
 import { DataTable } from "@/src/components/table/data-table";
-import TableLink from "@/src/components/table/table-link";
+import { createDropdownTableColumn } from "@/src/components/design-system/table/columns/createDropdownTableColumn";
+import { createLinkTableColumn } from "@/src/components/design-system/table/columns/createLinkTableColumn";
 import { api } from "@/src/utils/api";
 import { safeExtract } from "@/src/utils/map-utils";
 import { type RouterOutput } from "@/src/utils/types";
-import { useRouter } from "next/router";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuTrigger,
 } from "@/src/components/ui/dropdown-menu";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
-import { Archive, Edit, ListTree, MoreVertical, Trash2 } from "lucide-react";
-import { Button } from "@/src/components/ui/button";
+import { useMediaQuery } from "react-responsive";
+import { Archive, Edit, ListTree, Trash2 } from "@langfuse/icons";
 import {
-  type DatasetItem,
   datasetItemFilterColumns,
   DatasetStatus,
   type Prisma,
+  BatchExportTableName,
 } from "@langfuse/shared";
 import { type LangfuseColumnDef } from "@/src/components/table/types";
-import { useDetailPageLists } from "@/src/features/navigate-detail-pages/context";
+import { useDetailPageLists } from "@/src/features/navigate-detail-pages";
 import { useEffect, useState } from "react";
 import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
-import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
-import { useRowHeightLocalStorage } from "@/src/components/table/data-table-row-height-switch";
-import { IOTableCell } from "@/src/components/ui/IOTableCell";
-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
-import useColumnOrder from "@/src/features/column-visibility/hooks/useColumnOrder";
-import { StatusBadge } from "@/src/components/layouts/status-badge";
-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { type CsvPreviewResult } from "@/src/features/datasets/lib/csvHelpers";
-import { PreviewCsvImport } from "@/src/features/datasets/components/PreviewCsvImport";
-import { UploadDatasetCsv } from "@/src/features/datasets/components/UploadDatasetCsv";
-import { LocalIsoDate } from "@/src/components/LocalIsoDate";
+import {
+  useColumnOrder,
+  useColumnVisibility,
+} from "@/src/features/column-visibility";
+import {
+  customRowHeightMenu,
+  isCompactRowHeight,
+  useRowHeightLocalStorage,
+} from "@/src/components/table/data-table-row-height-switch";
+import { createIOTableColumn } from "@/src/components/design-system/table/columns/createIOTableColumn";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics";
+import { createStatusTableColumn } from "@/src/components/design-system/table/columns/createStatusTableColumn";
+import { type Status } from "@/src/components/ui/StatusBadge/StatusBadge";
+import { useHasProjectAccess } from "@/src/features/rbac";
+import { createDateTableColumn } from "@/src/components/design-system/table/columns/createDateTableColumn";
 import { BatchExportTableButton } from "@/src/components/BatchExportTableButton";
-import { BatchExportTableName } from "@langfuse/shared";
-import { useQueryFilterState } from "@/src/features/filters/hooks/useFilterState";
+import { useQueryFilterState } from "@/src/features/filters";
 import { useDebounce } from "@/src/hooks/useDebounce";
-import { useFullTextSearch } from "@/src/components/table/use-cases/useFullTextSearch";
+import { useFullTextSearch, TableSearchBar } from "@/src/features/search-bar";
+import { DATASET_ITEMS_FIELD_REGISTRY } from "../constants/datasetItemsSearchRegistry";
+import { useDatasetVersion } from "../hooks/useDatasetVersion";
+import { EditDatasetItemDialog } from "./EditDatasetItemDialog";
 
 type RowData = {
   id: string;
@@ -47,12 +51,17 @@ type RowData = {
     traceId: string;
     observationId?: string;
   };
-  status: DatasetItem["status"];
+  status: DatasetStatus;
   createdAt: Date;
   input: Prisma.JsonValue;
   expectedOutput: Prisma.JsonValue;
   metadata: Prisma.JsonValue;
 };
+
+const datasetStatusToStatus = {
+  [DatasetStatus.ACTIVE]: "active",
+  [DatasetStatus.ARCHIVED]: "archived",
+} satisfies Record<DatasetStatus, Status>;
 
 export function DatasetItemsTable({
   projectId,
@@ -63,20 +72,22 @@ export function DatasetItemsTable({
   datasetId: string;
   menuItems?: React.ReactNode;
 }) {
-  const router = useRouter();
   const { setDetailPageList } = useDetailPageLists();
   const utils = api.useUtils();
   const capture = usePostHogClientCapture();
-  const [preview, setPreview] = useState<CsvPreviewResult | null>(null);
-  const [csvFile, setCsvFile] = useState<File | null>(null);
   const [paginationState, setPaginationState] = useQueryParams({
     pageIndex: withDefault(NumberParam, 0),
     pageSize: withDefault(NumberParam, 50),
   });
 
-  const [rowHeight, setRowHeight] = useRowHeightLocalStorage(
+  const [rowHeight, setRowHeight, rowHeights] = useRowHeightLocalStorage(
     "datasetItems",
-    "s",
+    "m",
+  );
+  const compactRows = isCompactRowHeight(
+    rowHeight,
+    rowHeights.mode,
+    rowHeights.activeHeightPx,
   );
 
   const [filterState, setFilterState] = useQueryFilterState(
@@ -89,6 +100,15 @@ export function DatasetItemsTable({
     useFullTextSearch();
 
   const hasAccess = useHasProjectAccess({ projectId, scope: "datasets:CUD" });
+  const hasBatchExportAccess = useHasProjectAccess({
+    projectId,
+    scope: "batchExports:create",
+  });
+  const { selectedVersion } = useDatasetVersion();
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [selectedItemForEdit, setSelectedItemForEdit] = useState<string | null>(
+    null,
+  );
 
   const items = api.datasets.itemsByDatasetId.useQuery({
     projectId,
@@ -98,11 +118,7 @@ export function DatasetItemsTable({
     limit: paginationState.pageSize,
     searchQuery: searchQuery ?? undefined,
     searchType: searchType,
-  });
-
-  const totalDatasetItemCount = api.datasets.countItemsByDatasetId.useQuery({
-    projectId,
-    datasetId,
+    version: selectedVersion ?? undefined,
   });
 
   useEffect(() => {
@@ -124,200 +140,184 @@ export function DatasetItemsTable({
     onSuccess: () => utils.datasets.invalidate(),
   });
 
-  const columns: LangfuseColumnDef<RowData>[] = [
+  // Fetch selected item and dataset for edit dialog
+  const selectedItem = api.datasets.itemById.useQuery(
     {
-      accessorKey: "id",
-      header: "Item id",
-      id: "id",
-      size: 90,
-      isFixedPosition: true,
-      cell: ({ row }) => {
-        const id: string = row.getValue("id");
-        return (
-          <TableLink
-            path={`/project/${projectId}/datasets/${datasetId}/items/${id}`}
-            value={id}
-          />
-        );
-      },
+      projectId,
+      datasetId,
+      datasetItemId: selectedItemForEdit!,
     },
     {
+      enabled: selectedItemForEdit !== null && editDialogOpen,
+    },
+  );
+
+  const dataset = api.datasets.byId.useQuery(
+    {
+      projectId,
+      datasetId,
+    },
+    {
+      enabled: editDialogOpen,
+    },
+  );
+
+  const columns: LangfuseColumnDef<RowData>[] = [
+    createLinkTableColumn<RowData>({
+      accessorKey: "id",
+      header: "Item id",
+      size: 90,
+      isFixedPosition: true,
+      getCell: (id) => {
+        if (!id) return undefined;
+        let versionParam = "";
+        if (selectedVersion) {
+          versionParam = `?version=${encodeURIComponent(selectedVersion.toISOString())}`;
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/datasets/${datasetId}/items/${encodeURIComponent(id)}${versionParam}`,
+            value: id,
+          },
+        };
+      },
+    }),
+    createLinkTableColumn<RowData, RowData["source"]>({
       accessorKey: "source",
       header: "Source",
       headerTooltip: {
         description:
           "Link to the source trace based on which this item was added",
       },
-      id: "source",
       size: 90,
-      cell: ({ row }) => {
-        const source: RowData["source"] = row.getValue("source");
-        if (!source) return null;
-        return source.observationId ? (
-          <TableLink
-            path={`/project/${projectId}/traces/${encodeURIComponent(source.traceId)}?observation=${encodeURIComponent(source.observationId)}`}
-            value={source.observationId}
-            icon={<ListTree className="h-4 w-4" />}
-          />
-        ) : (
-          <TableLink
-            path={`/project/${projectId}/traces/${encodeURIComponent(source.traceId)}`}
-            value={source.traceId}
-            icon={<ListTree className="h-4 w-4" />}
-          />
-        );
+      getCell: (source) => {
+        if (!source) return undefined;
+        if (source.observationId) {
+          return {
+            type: "link",
+            props: {
+              path: `/project/${projectId}/traces/${encodeURIComponent(source.traceId)}?observation=${encodeURIComponent(source.observationId)}`,
+              value: source.observationId,
+              icon: ListTree,
+            },
+          };
+        }
+        return {
+          type: "link",
+          props: {
+            path: `/project/${projectId}/traces/${encodeURIComponent(source.traceId)}`,
+            value: source.traceId,
+            icon: ListTree,
+          },
+        };
       },
-    },
-    {
+    }),
+    createStatusTableColumn<RowData, DatasetStatus>({
       accessorKey: "status",
       header: "Status",
-      id: "status",
+      getStatus: (status) =>
+        status ? datasetStatusToStatus[status] : undefined,
       size: 80,
-      cell: ({ row }) => {
-        const status: DatasetStatus = row.getValue("status");
-        return (
-          <StatusBadge
-            className="capitalize"
-            type={status.toLowerCase()}
-            isLive={false}
-          />
-        );
-      },
-    },
-    {
+      isLive: false,
+    }),
+    createDateTableColumn<RowData>({
       accessorKey: "createdAt",
       header: "Created At",
-      id: "createdAt",
       size: 150,
       enableHiding: true,
-      cell: ({ row }) => {
-        const value: RowData["createdAt"] = row.getValue("createdAt");
-        return <LocalIsoDate date={value} />;
-      },
-    },
-    {
+    }),
+    createIOTableColumn<RowData>({
       accessorKey: "input",
       header: "Input",
-      id: "input",
       size: 200,
       enableHiding: true,
-      cell: ({ row }) => {
-        const input = row.getValue("input") as RowData["input"];
-        return input !== null ? (
-          <IOTableCell data={input} singleLine={rowHeight === "s"} />
-        ) : null;
-      },
-    },
-    {
+      singleLine: compactRows,
+    }),
+    createIOTableColumn<RowData>({
       accessorKey: "expectedOutput",
       header: "Expected Output",
-      id: "expectedOutput",
       size: 200,
       enableHiding: true,
-      cell: ({ row }) => {
-        const expectedOutput = row.getValue(
-          "expectedOutput",
-        ) as RowData["expectedOutput"];
-        return expectedOutput !== null ? (
-          <IOTableCell
-            data={expectedOutput}
-            className="bg-accent-light-green"
-            singleLine={rowHeight === "s"}
-          />
-        ) : null;
-      },
-    },
-    {
+      singleLine: compactRows,
+      variant: "output",
+    }),
+    createIOTableColumn<RowData>({
       accessorKey: "metadata",
       header: "Metadata",
-      id: "metadata",
       size: 200,
       enableHiding: true,
-      cell: ({ row }) => {
-        const metadata = row.getValue("metadata") as RowData["metadata"];
-        return metadata !== null ? (
-          <IOTableCell data={metadata} singleLine={rowHeight === "s"} />
-        ) : null;
-      },
-    },
-    {
+      singleLine: compactRows,
+    }),
+    createDropdownTableColumn<RowData, string>({
       id: "actions",
-      accessorKey: "actions",
+      accessorFn: (row) => row.id,
       header: "Actions",
       size: 70,
-      cell: ({ row }) => {
-        const id: string = row.getValue("id");
-        const status: DatasetStatus = row.getValue("status");
+      renderMenu: (id, { row }) => {
+        if (!id) return null;
+        const status = row.original.status;
         return (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="h-8 w-8 p-0">
-                <span className="sr-only [position:relative]">Open menu</span>
-                <MoreVertical className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Actions</DropdownMenuLabel>
-              <DropdownMenuItem
-                disabled={!hasAccess}
-                onClick={() => {
-                  router.push(
-                    `/project/${projectId}/datasets/${datasetId}/items/${id}`,
-                  );
-                }}
-              >
-                <Edit className="mr-2 h-4 w-4" />
-                Edit
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={!hasAccess}
-                onClick={() => {
-                  capture("dataset_item:archive_toggle", {
-                    status:
-                      status === DatasetStatus.ARCHIVED
-                        ? "unarchived"
-                        : "archived",
-                  });
-                  mutUpdate.mutate({
+          <>
+            <DropdownMenuLabel>Actions</DropdownMenuLabel>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              onClick={() => {
+                setSelectedItemForEdit(id);
+                setEditDialogOpen(true);
+              }}
+            >
+              <Edit size="base" color="default" __rawClassName="mr-2" />
+              Edit
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              onClick={() => {
+                capture("dataset_item:archive_toggle", {
+                  status:
+                    status === DatasetStatus.ARCHIVED
+                      ? "unarchived"
+                      : "archived",
+                });
+                mutUpdate.mutate({
+                  projectId: projectId,
+                  datasetId: datasetId,
+                  datasetItemId: id,
+                  status:
+                    status === DatasetStatus.ARCHIVED
+                      ? DatasetStatus.ACTIVE
+                      : DatasetStatus.ARCHIVED,
+                });
+              }}
+            >
+              <Archive size="base" color="default" __rawClassName="mr-2" />
+              {status === DatasetStatus.ARCHIVED ? "Unarchive" : "Archive"}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!hasAccess || !!selectedVersion}
+              className="text-destructive"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Are you sure you want to delete this item? This will also delete all run items that belong to this item.",
+                  )
+                ) {
+                  capture("dataset_item:delete");
+                  mutDelete.mutate({
                     projectId: projectId,
                     datasetId: datasetId,
                     datasetItemId: id,
-                    status:
-                      status === DatasetStatus.ARCHIVED
-                        ? DatasetStatus.ACTIVE
-                        : DatasetStatus.ARCHIVED,
                   });
-                }}
-              >
-                <Archive className="mr-2 h-4 w-4" />
-                {status === DatasetStatus.ARCHIVED ? "Unarchive" : "Archive"}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={!hasAccess}
-                className="text-destructive"
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      "Are you sure you want to delete this item? This will also delete all run items that belong to this item.",
-                    )
-                  ) {
-                    capture("dataset_item:delete");
-                    mutDelete.mutate({
-                      projectId: projectId,
-                      datasetId: datasetId,
-                      datasetItemId: id,
-                    });
-                  }
-                }}
-              >
-                <Trash2 className="mr-2 h-4 w-4" />
-                Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+                }
+              }}
+            >
+              <Trash2 size="base" __rawClassName="mr-2" />
+              Delete
+            </DropdownMenuItem>
+          </>
         );
       },
-    },
+    }),
   ];
 
   const convertToTableRow = (
@@ -331,7 +331,7 @@ export function DatasetItemsTable({
             observationId: item.sourceObservationId ?? undefined,
           }
         : undefined,
-      status: item.status,
+      status: item.status ?? "ACTIVE",
       createdAt: item.createdAt,
       input: item.input,
       expectedOutput: item.expectedOutput,
@@ -349,7 +349,7 @@ export function DatasetItemsTable({
     columns,
   );
 
-  const batchExportButton = (
+  const batchExportButton = hasBatchExportAccess ? (
     <BatchExportTableButton
       key="batchExport"
       projectId={projectId}
@@ -364,61 +364,39 @@ export function DatasetItemsTable({
         },
       ]}
     />
-  );
+  ) : null;
 
   const setFilterStateWithDebounce = useDebounce(setFilterState);
-  const setSearchQueryWithDebounce = useDebounce(setSearchQuery, 300);
-
-  if (totalDatasetItemCount.data === 0 && hasAccess) {
-    return (
-      <>
-        <DataTableToolbar
-          columns={columns}
-          filterColumnDefinition={datasetItemFilterColumns}
-          filterState={filterState}
-          setFilterState={setFilterStateWithDebounce}
-          columnVisibility={columnVisibility}
-          setColumnVisibility={setColumnVisibility}
-          columnOrder={columnOrder}
-          setColumnOrder={setColumnOrder}
-          rowHeight={rowHeight}
-          setRowHeight={setRowHeight}
-          actionButtons={[menuItems, batchExportButton].filter(Boolean)}
-          searchConfig={{
-            metadataSearchFields: ["ID"],
-            updateQuery: setSearchQueryWithDebounce,
-            currentQuery: searchQuery ?? undefined,
-            // Disable full text search as we don't have any dataset items added to the dataset yet.
-            tableAllowsFullTextSearch: false,
-            setSearchType,
-            searchType,
-            customDropdownLabels: {
-              metadata: "IDs",
-              fullText: "Full Text",
-            },
-            hidePerformanceWarning: true,
-          }}
-        />
-        {preview ? (
-          <PreviewCsvImport
-            preview={preview}
-            csvFile={csvFile}
-            projectId={projectId}
-            datasetId={datasetId}
-            setCsvFile={setCsvFile}
-            setPreview={setPreview}
-          />
-        ) : (
-          <UploadDatasetCsv setPreview={setPreview} setCsvFile={setCsvFile} />
-        )}
-      </>
-    );
-  }
+  // Below `md` the Filters sheet is the only mounted search bar. The query
+  // starts unmatched, and `hidden md:block` hides this slot until then.
+  const isMobile = useMediaQuery({ query: "(max-width: 767.98px)" });
+  const searchBar = (
+    <TableSearchBar
+      size="large"
+      key={`${projectId}:${datasetId}:${selectedVersion?.toISOString() ?? "latest"}`}
+      projectId={projectId}
+      tableName="dataset-items"
+      registry={DATASET_ITEMS_FIELD_REGISTRY}
+      filterState={filterState}
+      setFilterState={setFilterState}
+      observed={undefined}
+      isV4={false}
+      search={{
+        query: searchQuery,
+        type: searchType,
+        setQuery: setSearchQuery,
+        setType: setSearchType,
+      }}
+    />
+  );
 
   return (
     <>
+      {isMobile ? null : <div className="hidden md:block">{searchBar}</div>}
       <DataTableToolbar
         columns={columns}
+        tableName="dataset-items"
+        isV4={false}
         filterColumnDefinition={datasetItemFilterColumns}
         filterState={filterState}
         setFilterState={setFilterStateWithDebounce}
@@ -428,23 +406,12 @@ export function DatasetItemsTable({
         setColumnOrder={setColumnOrder}
         rowHeight={rowHeight}
         setRowHeight={setRowHeight}
+        customRowHeight={customRowHeightMenu(rowHeights)}
+        mobileSearch={searchBar}
         actionButtons={[menuItems, batchExportButton].filter(Boolean)}
-        searchConfig={{
-          metadataSearchFields: ["ID"],
-          updateQuery: setSearchQueryWithDebounce,
-          currentQuery: searchQuery ?? undefined,
-          tableAllowsFullTextSearch: true,
-          setSearchType,
-          searchType,
-          customDropdownLabels: {
-            metadata: "IDs",
-            fullText: "Full Text",
-          },
-          hidePerformanceWarning: true,
-        }}
       />
       <DataTable
-        tableName={"datasetItems"}
+        tableName="datasetItems"
         columns={columns}
         data={
           items.isPending
@@ -473,6 +440,30 @@ export function DatasetItemsTable({
         columnOrder={columnOrder}
         onColumnOrderChange={setColumnOrder}
         rowHeight={rowHeight}
+        customRowHeightPx={rowHeights.activeHeightPx}
+        onCustomRowHeightChange={rowHeights.setCustomPx}
+        onSelectRowHeight={setRowHeight}
+      />
+      <EditDatasetItemDialog
+        open={editDialogOpen}
+        onOpenChange={(open) => {
+          setEditDialogOpen(open);
+          if (!open) {
+            setSelectedItemForEdit(null);
+          }
+        }}
+        projectId={projectId}
+        datasetItem={selectedItem.data ?? null}
+        dataset={
+          dataset.data
+            ? {
+                id: dataset.data.id,
+                name: dataset.data.name,
+                inputSchema: dataset.data.inputSchema ?? null,
+                expectedOutputSchema: dataset.data.expectedOutputSchema ?? null,
+              }
+            : null
+        }
       />
     </>
   );

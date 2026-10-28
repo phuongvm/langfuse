@@ -1,9 +1,11 @@
-import { parseDbOrg, Prisma } from "@langfuse/shared";
+import { getBillingProvider, parseDbOrg, Prisma } from "@langfuse/shared";
 import { prisma } from "@langfuse/shared/src/db";
 import Stripe from "stripe";
 import { env } from "../../env";
 import {
   CloudUsageMeteringQueue,
+  CloudSpendAlertQueue,
+  compareWithBillingLedger,
   getObservationCountsByProjectInCreationInterval,
   getScoreCountsByProjectInCreationInterval,
   getTraceCountsByProjectInCreationInterval,
@@ -15,13 +17,82 @@ import {
 } from "./constants";
 import {
   QueueJobs,
-  recordGauge,
+  recordIncrement,
   traceException,
 } from "@langfuse/shared/src/server";
 import { Job } from "bullmq";
 import { backOff } from "exponential-backoff";
 
 const delayFromStartOfInterval = 3600000 + 5 * 60 * 1000; // 5 minutes after the end of the interval
+
+// Stripe deduplicates meter events by identifier, so deriving it from the tuple
+// that defines the billable fact makes a replayed interval idempotent instead of
+// adding a second time to the customer's usage. The meter name is part of the key
+// because both meters are reported for the same org and interval - without it the
+// two would collide and Stripe would drop one of them.
+const meterEventIdentifier = (
+  eventName: string,
+  orgId: string,
+  intervalStart: Date,
+) => `${eventName}:${orgId}:${intervalStart.getTime()}`;
+
+// Stripe does not silently drop a meter event whose identifier it has already
+// seen - it answers with a 400. Left to propagate, the first replayed org ends
+// the whole run, and because `lastRun` only advances after the org loop the same
+// interval is claimed again on the next tick: the replay the identifier was
+// added to make harmless instead stalls metering outright.
+const isDuplicateMeterEventError = (error: unknown): boolean => {
+  const stripeError = error as
+    | { statusCode?: unknown; rawType?: unknown; message?: unknown }
+    | null
+    | undefined;
+
+  return (
+    typeof stripeError === "object" &&
+    stripeError !== null &&
+    stripeError.statusCode === 400 &&
+    stripeError.rawType === "invalid_request_error" &&
+    typeof stripeError.message === "string" &&
+    /already exists with identifier/i.test(stripeError.message)
+  );
+};
+
+// Every other rejection still fails the job. Only the duplicate is safe to
+// swallow, because the identifier is derived from the tuple that defines the
+// billable fact, so Stripe already holding it is proof this usage was delivered.
+const sendMeterEvent = async (
+  stripe: Stripe,
+  params: Stripe.Billing.MeterEventCreateParams,
+) => {
+  try {
+    // retrying the stripe call in case of an HTTP error
+    await backOff(async () => await stripe.billing.meterEvents.create(params), {
+      numOfAttempts: 3,
+      // Stripe returns `stripe-should-retry: false` on a duplicate, so retrying
+      // only multiplies the rejection.
+      retry: (e) => !isDuplicateMeterEventError(e),
+    });
+  } catch (e) {
+    if (!isDuplicateMeterEventError(e)) {
+      throw e;
+    }
+
+    // Skip only this meter event, not the rest of the organization. Both meters
+    // are sent sequentially, so a run that died between them leaves one
+    // delivered and the other missing - skipping the org here would under-bill
+    // it for this interval for good.
+    logger.info(
+      `[CLOUD USAGE METERING] Stripe already holds meter event ${params.identifier}, skipping`,
+    );
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.duplicate_meter_events",
+      1,
+      {
+        unit: "events",
+      },
+    );
+  }
+};
 
 export const handleCloudUsageMeteringJob = async (job: Job) => {
   if (!env.STRIPE_SECRET_KEY) {
@@ -70,6 +141,7 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
     }
   }
 
+  const jobStartedAt = new Date();
   try {
     await prisma.cronJobs.update({
       where: {
@@ -79,7 +151,7 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
       },
       data: {
         state: CloudUsageMeteringDbCronJobStates.Processing,
-        jobStartedAt: new Date(),
+        jobStartedAt,
       },
     });
   } catch (e) {
@@ -117,11 +189,17 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
             deletedAt: null,
           },
         },
+        cloudSpendAlerts: {
+          select: {
+            id: true,
+          },
+        },
       },
     })
-  ).map(({ projects, ...org }) => ({
+  ).map(({ projects, cloudSpendAlerts, ...org }) => ({
     ...parseDbOrg(org),
     projectIds: projects.map((p) => p.id),
+    cloudSpendAlertIds: cloudSpendAlerts.map((a) => a.id),
   }));
   logger.info(
     `[CLOUD USAGE METERING] Job for ${organizations.length} organizations`,
@@ -152,6 +230,32 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
     // update progress to prevent job from being stalled
     job.updateProgress(countProcessedOrgs / organizations.length);
 
+    // Defensive guard: the org selection above keys on stripe.customerId,
+    // which CHB-billed orgs never get (their `stripe` block stays empty).
+    // If that invariant ever breaks, skip + count instead of double-metering —
+    // CHB meters its orgs by polling our billing metrics API.
+    if (
+      getBillingProvider(org, {
+        cutoff: env.LANGFUSE_CLOUD_BILLING_CHB_CUTOFF_DATE,
+        optInOrgIds: env.LANGFUSE_CLOUD_BILLING_CHB_OPT_IN_ORG_IDS,
+      }) !== "stripe"
+    ) {
+      traceException(
+        `[CLOUD USAGE METERING] Org ${org.id} resolves to a non-Stripe billing provider but carries a Stripe customer id, skipping`,
+      );
+      logger.error(
+        `[CLOUD USAGE METERING] Org ${org.id} resolves to a non-Stripe billing provider but carries a Stripe customer id, skipping`,
+      );
+      recordIncrement(
+        "langfuse.queue.cloud_usage_metering_queue.skipped_non_stripe_orgs",
+        1,
+        {
+          unit: "organizations",
+        },
+      );
+      continue;
+    }
+
     const stripeCustomerId = org.cloudConfig?.stripe?.customerId;
     if (!stripeCustomerId) {
       // should not happen
@@ -160,6 +264,20 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
       );
       logger.error(
         `[CLOUD USAGE METERING] Stripe customer id not found for org ${org.id}`,
+      );
+      recordIncrement(
+        "langfuse.queue.cloud_usage_metering_queue.skipped_orgs",
+        1,
+        {
+          unit: "organizations",
+        },
+      );
+      recordIncrement(
+        "langfuse.queue.cloud_usage_metering_queue.skipped_orgs_with_errors",
+        1,
+        {
+          unit: "organizations",
+        },
       );
       continue;
     }
@@ -173,20 +291,19 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
       `[CLOUD USAGE METERING] Job for org ${org.id} - ${stripeCustomerId} stripe customer id - ${countObservations} observations`,
     );
     if (countObservations > 0) {
-      await backOff(
-        async () =>
-          await stripe.billing.meterEvents.create({
-            event_name: "tracing_observations",
-            timestamp: meterIntervalEnd.getTime() / 1000,
-            payload: {
-              stripe_customer_id: stripeCustomerId,
-              value: countObservations.toString(), // value is a string in stripe
-            },
-          }),
-        {
-          numOfAttempts: 3,
+      await sendMeterEvent(stripe, {
+        event_name: "tracing_observations",
+        identifier: meterEventIdentifier(
+          "tracing_observations",
+          org.id,
+          meterIntervalStart,
+        ),
+        timestamp: meterIntervalEnd.getTime() / 1000,
+        payload: {
+          stripe_customer_id: stripeCustomerId,
+          value: countObservations.toString(), // value is a string in stripe
         },
-      );
+      });
     }
 
     // Events
@@ -201,51 +318,112 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
       `[CLOUD USAGE METERING] Job for org ${org.id} - ${stripeCustomerId} stripe customer id - ${countEvents} events`,
     );
     if (countEvents > 0) {
-      // retrying the stripe call in case of an HTTP error
-      await backOff(
-        async () =>
-          await stripe.billing.meterEvents.create({
-            event_name: "tracing_events",
-            timestamp: meterIntervalEnd.getTime() / 1000,
-            payload: {
-              stripe_customer_id: stripeCustomerId,
-              value: countEvents.toString(), // value is a string in stripe
-            },
-          }),
+      await sendMeterEvent(stripe, {
+        event_name: "tracing_events",
+        identifier: meterEventIdentifier(
+          "tracing_events",
+          org.id,
+          meterIntervalStart,
+        ),
+        timestamp: meterIntervalEnd.getTime() / 1000,
+        payload: {
+          stripe_customer_id: stripeCustomerId,
+          value: countEvents.toString(), // value is a string in stripe
+        },
+      });
+    }
+
+    if (countEvents === 0 && countObservations === 0) {
+      recordIncrement(
+        "langfuse.queue.cloud_usage_metering_queue.skipped_orgs",
+        1,
         {
-          numOfAttempts: 3,
+          unit: "organizations",
         },
       );
     }
 
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.processed_orgs",
+      1,
+      {
+        unit: "organizations",
+      },
+    );
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.processed_observations",
+      countObservations,
+      {
+        unit: "observations",
+      },
+    );
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.processed_events",
+      countEvents,
+      {
+        unit: "events",
+      },
+    );
     countProcessedOrgs++;
     countProcessedObservations += countObservations;
     countProcessedEvents += countEvents;
+
+    // Trigger spend alert job for orgs with activity and spend alerts configured
+    if (org.cloudSpendAlertIds.length > 0) {
+      if (countEvents > 0 || countObservations > 0) {
+        try {
+          await CloudSpendAlertQueue.getInstance()?.add(
+            QueueJobs.CloudSpendAlertJob,
+            { orgId: org.id },
+            { delay: 5 * 60 * 1000 }, // 5 minutes delay
+          );
+          logger.info(
+            `[CLOUD USAGE METERING] Enqueued spend alert job for org ${org.id} with 5min delay`,
+          );
+        } catch (error) {
+          logger.error(
+            `[CLOUD USAGE METERING] Failed to enqueue spend alert job for org ${org.id}`,
+            { error },
+          );
+          // Don't fail the metering job if spend alert enqueueing fails
+        }
+      }
+    }
   }
 
-  recordGauge("cloud_usage_metering_processed_orgs", countProcessedOrgs, {
-    unit: "organizations",
-  });
-  recordGauge(
-    "cloud_usage_metering_processed_observations",
-    countProcessedObservations,
-    {
-      unit: "observations",
-    },
-  );
-  recordGauge("cloud_usage_metering_processed_events", countProcessedEvents, {
-    unit: "events",
-  });
-
-  // update cron job
-  await prisma.cronJobs.update({
-    where: { name: cloudUsageMeteringDbCronJobName },
-    data: {
-      lastRun: meterIntervalEnd,
-      state: CloudUsageMeteringDbCronJobStates.Queued,
-      jobStartedAt: null,
-    },
-  });
+  // Advance the cron job only while still holding the lease claimed above. The
+  // stale-job takeover can hand this interval to another run mid-flight; without
+  // the predicate a superseded run would still move lastRun forward and mask the
+  // fact that another run owns the interval.
+  try {
+    await prisma.cronJobs.update({
+      where: {
+        name: cloudUsageMeteringDbCronJobName,
+        state: CloudUsageMeteringDbCronJobStates.Processing,
+        jobStartedAt,
+      },
+      data: {
+        lastRun: meterIntervalEnd,
+        state: CloudUsageMeteringDbCronJobStates.Queued,
+        jobStartedAt: null,
+      },
+    });
+  } catch (e) {
+    logger.warn(
+      "[CLOUD USAGE METERING] Job lease was taken over before completion, leaving cron state to the run that owns it now",
+      { e },
+    );
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.lost_job_lease",
+      1,
+      {
+        unit: "jobs",
+      },
+    );
+    // Returning rather than throwing keeps the queue wrapper from resetting the
+    // state and replaying this interval on top of the run that took it over.
+    return;
+  }
 
   logger.info(
     `[CLOUD USAGE METERING] Job for interval ${meterIntervalStart.toISOString()} - ${meterIntervalEnd.toISOString()} completed`,
@@ -256,13 +434,38 @@ export const handleCloudUsageMeteringJob = async (job: Job) => {
     },
   );
 
+  // Runs after the interval is metered and the lease released, and never
+  // throws, so it cannot delay or change what Stripe receives. It compares
+  // every project with usage, not only the Stripe-billed ones.
+  if (env.LANGFUSE_BILLING_LEDGER_SHADOW_ENABLED === "true") {
+    await compareWithBillingLedger({
+      source: "stripe_metering",
+      from: meterIntervalStart,
+      to: meterIntervalEnd,
+      legacy: {
+        traces: traceCountsByProject,
+        observations: observationCountsByProject,
+        scores: scoreCountsByProject,
+      },
+      orgIdByProjectId: new Map(
+        organizations.flatMap((org) =>
+          org.projectIds.map((projectId) => [projectId, org.id] as const),
+        ),
+      ),
+    });
+  }
+
   if (meterIntervalEnd.getTime() + delayFromStartOfInterval < Date.now()) {
     logger.info(
       `[CLOUD USAGE METERING] Enqueueing next Cloud Usage Metering Job to catch up `,
     );
-    recordGauge("cloud_usage_metering_scheduled_catchup_jobs", 1, {
-      unit: "jobs",
-    });
+    recordIncrement(
+      "langfuse.queue.cloud_usage_metering_queue.scheduled_catchup_jobs",
+      1,
+      {
+        unit: "jobs",
+      },
+    );
     await CloudUsageMeteringQueue.getInstance()?.add(
       QueueJobs.CloudUsageMeteringJob,
       {},

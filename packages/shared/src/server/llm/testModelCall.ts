@@ -1,52 +1,69 @@
-import { z as zodV3 } from "zod/v3";
 import {
   ChatMessageRole,
   ChatMessageType,
   LLMApiKeySchema,
+  type LLMJSONSchema,
   type ModelConfig,
 } from "./types";
-import { decrypt } from "../../encryption";
-import { fetchLLMCompletion } from "./fetchLLMCompletion";
-import { decryptAndParseExtraHeaders } from "./utils";
-import z from "zod/v4";
+import {
+  createLLMOutput,
+  generateLLMText,
+  mapLegacyLLMCompletionParams,
+} from "./llmText";
+import z, { type ZodType } from "zod";
+
+type StructuredOutputSchema = ZodType | LLMJSONSchema;
 
 export const testModelCall = async ({
   provider,
   model,
   apiKey,
-  prompt,
   modelConfig,
+  structuredOutputSchema,
+  timeout,
 }: {
   provider: string;
   model: string;
   apiKey: z.infer<typeof LLMApiKeySchema>;
-  prompt?: string;
   modelConfig?: ModelConfig | null;
+  structuredOutputSchema?: StructuredOutputSchema;
+  timeout?: number;
 }) => {
-  (
-    await fetchLLMCompletion({
-      streaming: false,
-      apiKey: decrypt(apiKey.secretKey), // decrypt the secret key
-      extraHeaders: decryptAndParseExtraHeaders(apiKey.extraHeaders),
-      baseURL: apiKey.baseURL ?? undefined,
+  const schema =
+    structuredOutputSchema ??
+    z.object({
+      score: z.string(),
+      reasoning: z.string(),
+    });
+  const promptSchema =
+    schema instanceof Object && "~standard" in schema
+      ? z.toJSONSchema(schema as ZodType)
+      : schema;
+
+  const result = await generateLLMText({
+    ...mapLegacyLLMCompletionParams({
+      connection: apiKey,
       messages: [
         {
           role: ChatMessageRole.User,
-          content: prompt ?? "mock content",
+          content: `Generate one example response that conforms to this JSON schema. Respect the type, description, allowed values, and bounds of every field. Keep any reasoning brief.
+
+JSON schema:
+${JSON.stringify(promptSchema)}`,
           type: ChatMessageType.User,
         },
       ],
       modelParams: {
-        provider: provider,
-        model: model,
+        provider,
+        model,
         adapter: apiKey.adapter,
         ...modelConfig,
       },
-      structuredOutputSchema: zodV3.object({
-        score: zodV3.string(),
-        reasoning: zodV3.string(),
-      }),
-      config: apiKey.config,
-    })
-  ).completion;
+    }),
+    output: createLLMOutput(schema),
+    timeout,
+  });
+
+  // Accessing output makes the AI SDK validate that structured output exists.
+  const { output: _output } = result;
 };

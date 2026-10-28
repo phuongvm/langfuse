@@ -1,10 +1,19 @@
-import React from "react";
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
 import {
   SplashScreen,
   type ValueProposition,
-} from "@/src/components/ui/splash-screen";
-import { Database, Beaker, Zap, Code } from "lucide-react";
-import { DatasetActionButton } from "@/src/features/datasets/components/DatasetActionButton";
+} from "@/src/components/ui/SplashScreen";
+import { ButtonWithIcon } from "@/src/components/ButtonWithIcon";
+import { DialogTrigger } from "@/src/components/ui/dialog";
+import { CreateDatasetDialogController } from "@/src/features/datasets/components/CreateDatasetDialogController";
+import {
+  Database,
+  Beaker,
+  Zap,
+  Code,
+  LockIcon,
+  PlusIcon,
+} from "@langfuse/icons";
 
 export function DatasetsOnboarding({ projectId }: { projectId: string }) {
   const valuePropositions: ValueProposition[] = [
@@ -12,47 +21,59 @@ export function DatasetsOnboarding({ projectId }: { projectId: string }) {
       title: "Continuous improvement",
       description:
         "Create datasets from production edge cases to improve your application",
-      icon: <Zap className="h-4 w-4" />,
+      icon: Zap,
     },
     {
       title: "Pre-deployment testing",
       description: "Benchmark new releases before deploying to production",
-      icon: <Beaker className="h-4 w-4" />,
+      icon: Beaker,
     },
     {
       title: "Structured testing",
       description:
         "Run experiments on collections of inputs and expected outputs",
-      icon: <Database className="h-4 w-4" />,
+      icon: Database,
     },
     {
       title: "Custom workflows",
       description:
         "Build custom workflows around your datasets via the API and SDKs, e.g. for fine-tuning, few-shotting",
-      icon: <Code className="h-4 w-4" />,
+      icon: Code,
     },
   ];
 
   return (
     <SplashScreen
-      title="Get Started with Datasets"
-      description="Datasets in Langfuse are collections of inputs (and expected outputs) for your LLM application. You can for example use them to benchmark new releases before deployment to production."
+      title="Get Started with Datasets & Experiments"
+      description="Datasets in Langfuse are collections of inputs (and expected outputs) for your LLM application. You can run Experiments against these datasets to test new releases before deployment to production."
       valuePropositions={valuePropositions}
       primaryAction={{
         label: "Create Dataset",
         component: (
-          <DatasetActionButton
-            variant="default"
-            mode="create"
+          <CreateDatasetDialogController
             projectId={projectId}
-            size="lg"
-          />
+            target={{ type: "root" }}
+          >
+            {({ disabled, openDialog }) => (
+              <DialogTrigger asChild>
+                <ButtonWithIcon
+                  size="lg"
+                  disabled={disabled !== undefined}
+                  onClick={openDialog}
+                  variant="default"
+                  icon={disabled === undefined ? PlusIcon : LockIcon}
+                  text="New dataset"
+                />
+              </DialogTrigger>
+            )}
+          </CreateDatasetDialogController>
         ),
       }}
       secondaryAction={{
         label: "Learn More",
         href: "https://langfuse.com/docs/datasets",
       }}
+      videoSrc="https://static.langfuse.com/prod-assets/onboarding/datasets-overview-v1.mp4"
     />
   );
 }

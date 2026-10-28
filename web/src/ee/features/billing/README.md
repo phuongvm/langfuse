@@ -23,12 +23,12 @@ See `web/src/ee/features/billing/server/cloudBillingRouter.ts`.
 - `clearPlanSwitchSchedule` — releases any active/not-started schedule.
 - `getStripeCustomerPortalUrl` — portal for payment methods, tax IDs, invoices (not for plan switches).
 - `getInvoices` — paginated invoice list with subscription/usage/tax breakdown and preview row.
-- `getUsage` — usage for current period from Stripe preview; falls back to ClickHouse aggregate.
-- `getUsageAlerts` / `upsertUsageAlerts` — toggle and configure Stripe usage alerts. (don't work correctly atm)
+
+The billing page also embeds the usage breakdown chart from `web/src/features/organization-usage` (MIT, `organizationUsage.breakdown`). It counts units with the same `created_at` definition as metering. Self-hosted deployments show the same chart on the organization's Usage settings page instead.
 
 ### Checkout and Subscription Management
 
-Implemented in `web/src/ee/features/billing/server/stripeBillingService.ts`.
+Implemented in `web/src/ee/features/billing/server/stripe/stripeBillingService.ts`.
 
 1. **Checkout**
    - Initiated from billing settings; only products from the catalogue are allowed.
@@ -62,7 +62,7 @@ Implemented in `web/src/ee/features/billing/server/stripeBillingService.ts`.
 
 ### Webhooks
 
-See `web/src/ee/features/billing/server/stripeWebhookHandler.ts`.
+See `web/src/ee/features/billing/server/stripe/stripeWebhookHandler.ts`.
 
 - Validates signature; ensures events are handled only in the correct `cloudRegion`.
 - Ensures subscription metadata (`orgId`, `cloudRegion`) is set (falls back to checkout session lookup if needed).

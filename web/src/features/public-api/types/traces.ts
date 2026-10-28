@@ -1,25 +1,25 @@
 import { APIObservation } from "@/src/features/public-api/types/observations";
 import {
   APIScoreSchemaV1,
+  commaSeparatedEnumArray,
+  deprecationResponseZod,
   paginationMetaResponseZod,
   orderBy,
+  optionalJsonParam,
   publicApiPaginationZod,
+  singleFilterList,
 } from "@langfuse/shared";
-import { stringDateTime, TraceBody } from "@langfuse/shared/src/server";
-import { z } from "zod/v4";
-
-/**
- * Field groups for selective field fetching
- */
-export const TRACE_FIELD_GROUPS = [
-  "core",
-  "io",
-  "scores",
-  "observations",
-  "metrics",
-] as const;
-
-export type TraceFieldGroup = (typeof TRACE_FIELD_GROUPS)[number];
+import {
+  stringDateTime,
+  TraceBody,
+  TRACE_FIELD_GROUPS,
+} from "@langfuse/shared/src/server";
+import { z } from "zod";
+import { useEventsTableSchema } from "@langfuse/shared/query";
+export {
+  TRACE_FIELD_GROUPS,
+  type TraceFieldGroup,
+} from "@langfuse/shared/src/server";
 
 /**
  * Objects
@@ -81,22 +81,17 @@ export const GetTracesV1Query = z.object({
       return { column, order: order?.toUpperCase() };
     })
     .pipe(orderBy.nullable()),
-  fields: z
-    .string()
-    .nullish()
-    .transform((v) => {
-      if (!v) return null;
-      return v
-        .split(",")
-        .map((f) => f.trim())
-        .filter((f) => TRACE_FIELD_GROUPS.includes(f as TraceFieldGroup));
-    })
-    .pipe(z.array(z.enum(TRACE_FIELD_GROUPS)).nullable()),
+  fields: commaSeparatedEnumArray(TRACE_FIELD_GROUPS, null, {
+    unknownValues: "filter",
+  }).transform((fields) => (fields && fields.length > 0 ? fields : null)),
+  useEventsTable: useEventsTableSchema,
+  filter: optionalJsonParam(singleFilterList, "filter"),
 });
 export const GetTracesV1Response = z
   .object({
     data: z.array(APIExtendedTrace),
     meta: paginationMetaResponseZod,
+    _deprecation: deprecationResponseZod.optional(),
   })
   .strict();
 
@@ -107,10 +102,14 @@ export const PostTracesV1Response = z.object({ id: z.string() });
 // GET /api/public/traces/{traceId}
 export const GetTraceV1Query = z.object({
   traceId: z.string(),
+  fields: commaSeparatedEnumArray(TRACE_FIELD_GROUPS, null, {
+    unknownValues: "filter",
+  }).transform((fields) => (fields && fields.length > 0 ? fields : null)),
 });
 export const GetTraceV1Response = APIExtendedTrace.extend({
   scores: z.array(APIScoreSchemaV1),
   observations: z.array(APIObservation),
+  _deprecation: deprecationResponseZod.optional(),
 }).strict();
 
 // DELETE /api/public/traces/{traceId}
@@ -126,7 +125,10 @@ export const DeleteTraceV1Response = z
 // DELETE /api/public/traces
 export const DeleteTracesV1Body = z
   .object({
-    traceIds: z.array(z.string()).min(1, "At least 1 traceId is required."),
+    traceIds: z
+      .array(z.string())
+      .min(1, "At least 1 traceId is required.")
+      .max(1000, "Cannot specify more than 1000 traces in a single request."),
   })
   .strict();
 export const DeleteTracesV1Response = z

@@ -1,7 +1,7 @@
 import React from "react";
-import { CheckCircle, AlertCircle } from "lucide-react";
-import { Badge } from "@/src/components/ui/badge";
-import { Button } from "@/src/components/ui/button";
+import { CheckCircle, AlertCircle, Unlink } from "@langfuse/icons";
+import { Badge } from "@/src/components/design-system/Badge/Badge";
+import { Button } from "@/src/components/design-system/Button/Button";
 import {
   Card,
   CardContent,
@@ -9,10 +9,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/card";
-import { Alert, AlertDescription } from "@/src/components/ui/alert";
+import { Alert } from "@/src/components/design-system/Alert/Alert";
 import { api } from "@/src/utils/api";
 import { SlackConnectButton } from "@/src/features/slack/components/SlackConnectButton";
-import { SlackDisconnectButton } from "@/src/features/slack/components/SlackDisconnectButton";
+import { SlackDisconnectDialogController } from "@/src/features/slack/components/SlackDisconnectDialogController";
 
 /**
  * Props for the SlackConnectionCard component
@@ -82,7 +82,7 @@ export const SlackConnectionCard: React.FC<SlackConnectionCardProps> = ({
           <CardDescription>Checking connection status...</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center gap-2 text-muted-foreground">
+          <div className="text-muted-foreground flex items-center gap-2">
             <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
             <span>Loading...</span>
           </div>
@@ -102,11 +102,10 @@ export const SlackConnectionCard: React.FC<SlackConnectionCardProps> = ({
           <CardDescription>Error loading connection status</CardDescription>
         </CardHeader>
         <CardContent>
-          <Alert>
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>
+          <Alert icon={AlertCircle}>
+            <Alert.Description>
               Failed to load Slack integration status. Please try again.
-            </AlertDescription>
+            </Alert.Description>
           </Alert>
         </CardContent>
       </Card>
@@ -127,14 +126,13 @@ export const SlackConnectionCard: React.FC<SlackConnectionCardProps> = ({
         </CardHeader>
         <CardContent className="space-y-4">
           {integrationStatus?.error && (
-            <Alert>
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>{integrationStatus.error}</AlertDescription>
+            <Alert icon={AlertCircle}>
+              <Alert.Description>{integrationStatus.error}</Alert.Description>
             </Alert>
           )}
 
           <div className="space-y-2">
-            <p className="text-sm text-muted-foreground">
+            <p className="text-muted-foreground text-sm">
               Connect your Slack workspace to enable real-time notifications for
               your automations.
             </p>
@@ -167,55 +165,66 @@ export const SlackConnectionCard: React.FC<SlackConnectionCardProps> = ({
       <CardContent className="space-y-4">
         {/* Connection Status */}
         <div className="flex items-center gap-2">
-          <CheckCircle className="h-4 w-4 text-green-500" />
-          <span className="text-sm font-medium">Connected</span>
+          <CheckCircle size="base" __rawClassName="text-green-500" />
+          <span className="text-sm font-bold">Connected</span>
         </div>
 
         {/* Team Information */}
         <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">Workspace:</span>
-            <Badge variant="secondary" className="text-xs">
-              {integrationStatus.teamName}
-            </Badge>
+            <span className="text-sm font-bold">Workspace:</span>
+            <Badge color="filled" text={integrationStatus.teamName ?? ""} />
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">Team ID:</span>
-            <Badge variant="outline" className="font-mono text-xs">
-              {integrationStatus.teamId}
-            </Badge>
+            <span className="text-sm font-bold">Team ID:</span>
+            <Badge
+              color="primary"
+              font="mono"
+              text={integrationStatus.teamId ?? ""}
+            />
           </div>
 
           {integrationStatus.botUserId && (
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Bot User:</span>
-              <Badge variant="outline" className="font-mono text-xs">
-                {integrationStatus.botUserId}
-              </Badge>
+              <span className="text-sm font-bold">Bot User:</span>
+              <Badge
+                color="primary"
+                font="mono"
+                text={integrationStatus.botUserId}
+              />
             </div>
           )}
         </div>
 
         {/* Management Actions */}
         <div className="flex gap-2 pt-2">
-          <SlackDisconnectButton
+          <SlackDisconnectDialogController
             projectId={projectId}
-            disabled={disabled}
             onSuccess={() => handleConnectionChange(false)}
             onError={(error: Error) => {
               console.error("Slack disconnection error:", error);
             }}
-          />
+          >
+            {({ isPending, openDialog }) => (
+              <Button
+                text="Disconnect"
+                icon={Unlink}
+                variant="destructive"
+                size="sm"
+                onClick={openDialog}
+                disabled={disabled || isPending}
+              />
+            )}
+          </SlackDisconnectDialogController>
 
           <Button
-            variant="outline"
+            text="Refresh Status"
+            variant="secondary"
             size="sm"
             onClick={() => refetchStatus()}
             disabled={disabled}
-          >
-            Refresh Status
-          </Button>
+          />
         </div>
       </CardContent>
     </Card>

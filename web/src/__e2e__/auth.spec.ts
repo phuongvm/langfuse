@@ -1,21 +1,15 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { test, expect } from "@playwright/test";
+import { signIn } from "./utils/auth";
 
 test("should redirect to sign-in if not signed in", async ({ page }) => {
   await page.goto("/");
-  await page.waitForTimeout(2000);
-  await expect(page).toHaveURL("/auth/sign-in");
+  await expect(page).toHaveURL(/\/auth\/sign-in(\?.*)?$/);
 });
 
 test("should redirect to home if signed in", async ({ page }) => {
   await page.goto("/auth/sign-in");
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-
-  // wait 2 seconds
-  await page.waitForTimeout(2000);
-
-  await expect(page).toHaveURL("/");
+  await signIn(page);
 });
 
 test("Successfully sign up & able to go to homepage", async ({ page }) => {
@@ -24,9 +18,8 @@ test("Successfully sign up & able to go to homepage", async ({ page }) => {
   await page.fill('input[name="email"]', randomEmailAddress());
   await page.fill('input[type="password"]', "Password2#!");
   await page.click('button[data-testid="submit-email-password-sign-up-form"]');
-  await page.waitForTimeout(2000);
   // see get started page
-  await expect(page).toHaveURL("/");
+  await expect(page).toHaveURL("/onboarding");
 });
 
 test("Successfully sign up & able to go to homepage with uppercase email", async ({
@@ -37,9 +30,8 @@ test("Successfully sign up & able to go to homepage with uppercase email", async
   await page.fill('input[name="email"]', "A" + randomEmailAddress());
   await page.fill('input[type="password"]', "Password3#!");
   await page.click('button[data-testid="submit-email-password-sign-up-form"]');
-  await page.waitForTimeout(2000);
   // see get started page
-  await expect(page).toHaveURL("/");
+  await expect(page).toHaveURL("/onboarding");
 });
 
 test("Signup input validation", async ({ page }) => {
@@ -66,12 +58,7 @@ test("Unauthenticated user should be redirected to target URL after login", asyn
   page,
 }) => {
   await page.goto("/auth/sign-in");
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-
-  // wait 2 seconds
-  await page.waitForTimeout(2000);
+  await signIn(page);
 
   // project id and prompt from seed.ts
   const promptUrl =
@@ -81,21 +68,13 @@ test("Unauthenticated user should be redirected to target URL after login", asyn
 
   await page.getByRole("menuitem", { name: "Sign Out" }).click();
 
-  await expect(page).toHaveURL("/auth/sign-in");
+  await expect(page).toHaveURL(/\/auth\/sign-in(\?.*)?$/);
 
   await page.goto(promptUrl);
 
-  await page.waitForTimeout(2000);
-
   await expect(page).toHaveURL(/targetPath/);
 
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-
-  await page.waitForTimeout(2000);
-
-  await expect(page).toHaveURL(promptUrl);
+  await signIn(page, { expectedUrl: promptUrl });
 });
 
 test("Unauthenticated user should not be redirected to non-relative URLs after login", async ({
@@ -106,15 +85,8 @@ test("Unauthenticated user should not be redirected to non-relative URLs after l
     `/auth/sign-in?targetPath=${encodeURIComponent(nonRelativeUrl)}`,
   );
 
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-
-  // Wait for navigation
-  await page.waitForTimeout(2000);
-
-  // Expect to be redirected to the home page, not the non-relative URL
-  await expect(page).toHaveURL("/");
+  // Lands on the home page, not on the non-relative targetPath
+  await signIn(page, { expectedUrl: "/" });
 
   // Verify we're logged in
   await expect(page.getByRole("button", { name: /Demo User/ })).toBeVisible();
@@ -128,13 +100,6 @@ test("Unauthenticated user should be redirected to relative URL after login", as
     `/auth/sign-in?targetPath=${encodeURIComponent(relativeUrl)}`,
   );
 
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-
-  // Wait for navigation
-  await page.waitForTimeout(2000);
-
   // Expect to be redirected to the relative URL
-  await expect(page).toHaveURL(relativeUrl);
+  await signIn(page, { expectedUrl: relativeUrl });
 });

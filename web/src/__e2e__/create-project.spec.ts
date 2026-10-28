@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { test, expect, type Page } from "@playwright/test";
 import { prisma } from "@langfuse/shared/src/db";
+import { signIn } from "./utils/auth";
 
 // const checkConsoleErrors = async (page: Page) => {
 //   const errors: string[] = [];
@@ -39,38 +41,26 @@ test.describe("Create project", () => {
 
     // Sign in
     await page.goto("/auth/sign-in");
-    await page.fill('input[name="email"]', "demo@langfuse.com");
-    await page.fill('input[type="password"]', "password");
-    await page.click(
-      'button[data-testid="submit-email-password-sign-in-form"]',
-    );
-    await page.waitForTimeout(2000);
-    await expect(page).toHaveURL("/");
+    await signIn(page);
 
-    // Start create org flow
-    await page.isVisible('[data-testid="create-organization-btn"]');
+    // Start create org flow. `page.isVisible` does not wait and its result
+    // was discarded, so the click below carried the whole wait on its 10s
+    // action timeout; assert it instead.
+    await expect(
+      page.locator('[data-testid="create-organization-btn"]'),
+    ).toBeVisible();
     await page.click('[data-testid="create-organization-btn"]');
-    await page.waitForTimeout(2000);
     await expect(page).toHaveURL("/setup");
 
     // Create an organization
     await expect(page.locator("data-testid=new-org-form")).toBeVisible();
     await page.fill('[data-testid="new-org-name-input"]', "e2e test org");
     await page.click('button[type="submit"]');
-    await page.waitForTimeout(5000);
-    expect(page.url()).toContain("/organization/");
-    expect(page.url()).toContain("/setup?orgstep=invite-members");
-
-    // Parse the organization ID from the URL using a simpler method
-    const url = new URL(page.url());
-    const organizationId = url.pathname.split("/")[2];
-    console.log("organization", organizationId);
-
-    // Skip add new members step
-    await page.isVisible('[data-testid="btn-skip-add-members"]');
-    await page.click('[data-testid="btn-skip-add-members"]');
-    expect(page.url()).toContain(
-      "/organization/" + organizationId + "/setup?orgstep=create-project",
+    await expect(page).toHaveURL(
+      /\/organization\/.*\/setup\?orgstep=create-project/,
+      {
+        timeout: 15000,
+      },
     );
 
     // Create project
@@ -80,21 +70,21 @@ test.describe("Create project", () => {
       "e2e test project",
     );
     await page.click('button[type="submit"]');
-    await page.waitForTimeout(5000);
-    expect(page.url()).toContain("/project/");
-    expect(page.url()).toContain("/setup");
+
+    // should be redirected to the traces page of the new project
+    await expect(page).toHaveURL(/\/project\/.*\/traces/, { timeout: 15000 });
 
     const projectUrl = new URL(page.url());
     const projectId = projectUrl.pathname.split("/")[2];
 
     // check that the project exists by navigating to its home screen
     await page.goto("/project/" + projectId);
-    await page.waitForTimeout(2000);
-    expect(page.url()).toContain("/project/" + projectId);
-    expect(page.url()).not.toContain("/setup");
+    await expect(page).toHaveURL(
+      (url) => url.pathname === `/project/${projectId}`,
+    );
 
-    const headings = await page.locator("h2").allTextContents();
-    expect(headings).toContain("Home");
+    await page.waitForTimeout(10000);
+    await checkPageHeaderTitle(page, "Home");
 
     // Check for console errors
     // expect(errors).toHaveLength(0);
@@ -119,11 +109,8 @@ test.describe("Create project", () => {
       // const errors = await checkConsoleErrors(page);
       await signin(page);
 
-      await page.waitForTimeout(2000);
-
       const projectUrl = await getProjectUrlForEmail("demo@langfuse.com");
       await page.goto(projectUrl + url, { waitUntil: "networkidle" });
-      await page.waitForTimeout(2000);
       await expect(page).toHaveURL(projectUrl + url);
       await checkPageHeaderTitle(page, title);
 
@@ -141,11 +128,7 @@ test.describe("Create project", () => {
 
 const signin = async (page: Page) => {
   await page.goto("/auth/sign-in");
-  await page.fill('input[name="email"]', "demo@langfuse.com");
-  await page.fill('input[type="password"]', "password");
-  await page.click('button[data-testid="submit-email-password-sign-in-form"]');
-  await page.waitForTimeout(2000);
-  await expect(page).toHaveURL("/");
+  await signIn(page);
 };
 
 const checkPageHeaderTitle = async (page: Page, title: string) => {

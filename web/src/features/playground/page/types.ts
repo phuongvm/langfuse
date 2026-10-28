@@ -28,6 +28,12 @@ export type PlaceholderMessageFillIn = {
   isUsed: boolean;
 };
 
+export type PlaygroundSourcePrompt = {
+  name: string;
+  version: number;
+  initialMessagesFingerprint: string;
+};
+
 export type PlaygroundCache = {
   messages: (ChatMessage | PlaceholderMessage)[];
   modelParams?: Partial<UIModelParams> &
@@ -37,6 +43,7 @@ export type PlaygroundCache = {
   messagePlaceholders?: PlaceholderMessageFillIn[];
   tools?: PlaygroundTool[];
   structuredOutputSchema?: PlaygroundSchema | null;
+  sourcePrompt?: PlaygroundSourcePrompt | null;
 } | null;
 
 // Multi-window types and interfaces
@@ -52,6 +59,8 @@ export interface PlaygroundHandle {
   stopExecution: () => void;
   /** Getter for current streaming state */
   getIsStreaming: () => boolean;
+  /** Getter for whether a model is configured */
+  hasModelConfigured: () => boolean;
 }
 
 /**
@@ -71,6 +80,8 @@ export interface WindowCoordinationReturn {
   getExecutionStatus: () => string | null;
   /** Whether any windows are currently executing */
   isExecutingAll: boolean;
+  /** Whether any window has a model configured */
+  hasAnyModelConfigured: boolean;
 }
 
 /**
@@ -104,6 +115,7 @@ export const PLAYGROUND_EVENTS = {
   WINDOW_REGISTERED: "playground:window-registered",
   WINDOW_UNREGISTERED: "playground:window-unregistered",
   WINDOW_EXECUTION_STATE_CHANGE: "playground:window-execution-state-change",
+  WINDOW_MODEL_CONFIG_CHANGE: "playground:window-model-config-change",
 } as const;
 
 /**

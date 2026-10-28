@@ -1,4 +1,6 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import ipaddr from "ipaddr.js";
+import { parseBlockedCidr } from "./parseBlockedCidr";
 
 // Static deny-list (IPv4 + IPv6) for SSRF protection
 const BLOCKED_CIDRS = [
@@ -26,8 +28,12 @@ const BLOCKED_CIDRS = [
   "fe80::/10", // link-local
   "ff00::/8", // multicast
   "100::/64", // discard-only
+  "64:ff9b::/96", // NAT64 IPv4 embedded in IPv6
+  "64:ff9b:1::/48", // NAT64 IPv4 embedded in IPv6 (local-use)
+  "::/96", // IPv4-compatible IPv6
   "2001::/32", // Teredo tunneling
   "2001:db8::/32", // doc
+  "2002::/16", // IPv6 prefix for transmitting IPv6 to IPv4 via 6to4 tunneling
 ];
 
 // Pre-parse blocked networks once for performance
@@ -47,14 +53,37 @@ const blockedNetworks = BLOCKED_CIDRS.map((cidr) => {
 export function isIPBlocked(
   ipString: string,
   whitelistedIPs: string[],
+  whiteListedIpSegments: string[],
+  blockedIpSegments: string[] = [],
 ): boolean {
   try {
+    const cleanedIp = normalizeIPAddress(ipString);
+
     // Check if IP is in whitelist first
-    if (whitelistedIPs.includes(ipString.toLowerCase().trim())) {
+    if (whitelistedIPs.includes(cleanedIp)) {
       return false;
     }
 
-    const ip = ipaddr.parse(ipString);
+    const ip = ipaddr.parse(cleanedIp);
+
+    const whitelistedSegments = whiteListedIpSegments.map((cidr) => {
+      const [addr, bits] = cidr.split("/");
+      const parsed = ipaddr.parse(addr);
+      return {
+        network: parsed,
+        kind: parsed.kind(),
+        mask: parseInt(bits, 10),
+      };
+    });
+
+    for (const { network, mask, kind } of whitelistedSegments) {
+      if (ip.kind() !== kind) continue;
+      if (ip.match(network, mask)) return false;
+    }
+
+    for (const cidr of blockedIpSegments ?? []) {
+      if (ipMatchesCidr(ip, cidr)) return true;
+    }
 
     for (const { network, mask, kind } of blockedNetworks) {
       if (ip.kind() !== kind) continue;
@@ -71,8 +100,7 @@ export function isIPBlocked(
  * Check if a string is an IP address
  */
 export function isIPAddress(hostname: string): boolean {
-  // Remove brackets from IPv6 addresses
-  const cleaned = hostname.replace(/^\[|\]$/g, "");
+  const cleaned = normalizeIPAddress(hostname);
 
   try {
     ipaddr.parse(cleaned);
@@ -100,6 +128,8 @@ export function isHostnameBlocked(hostname: string): boolean {
     // Cloud metadata endpoints
     "metadata.google.internal",
     "169.254.169.254",
+    "fd00:ec2::254",
+    "[fd00:ec2::254]",
 
     // Docker/container networking
     "host.docker.internal",
@@ -118,4 +148,22 @@ export function isHostnameBlocked(hostname: string): boolean {
   }
 
   return false;
+}
+
+function ipMatchesCidr(
+  ip: ReturnType<typeof ipaddr.parse>,
+  cidr: string,
+): boolean {
+  // A malformed operator CIDR must not fail the whole check closed: that
+  // would block every public address. Startup validation uses this parser.
+  const parsed = parseBlockedCidr(cidr);
+  if (!parsed || ip.kind() !== parsed.network.kind()) return false;
+  return ip.match(parsed.network, parsed.prefix);
+}
+
+function normalizeIPAddress(ipString: string): string {
+  return ipString
+    .toLowerCase()
+    .trim()
+    .replace(/^\[|\]$/g, "");
 }

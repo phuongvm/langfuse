@@ -1,18 +1,32 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 import { hash } from "bcryptjs";
 import { v4 } from "uuid";
 import { encrypt } from "../../src/encryption";
+import { IN_APP_AGENT_SYSTEM_PROMPT_TEMPLATE } from "../../src/in-app-agent/server/systemPrompt";
 import {
+  EvalTemplateSourceCodeLanguage,
+  EvalTemplateType,
   type JobConfiguration,
+  JobConfigState,
   JobExecutionStatus,
   PrismaClient,
   type Project,
-  ScoreDataType,
+  ScoreConfigCategoryDomain,
+  ScoreDataTypeEnum,
+  type ScoreDataTypeType,
 } from "../../src/index";
-import { getDisplaySecretKey, hashSecretKey, logger } from "../../src/server";
+import { createApiKey, getDisplaySecretKey, logger } from "../../src/server";
+import {
+  OrganizationId,
+  ProjectId,
+  SystemRoleId,
+  UserId,
+} from "../../src/features/rbac/types";
 import { redis } from "../../src/server/redis/redis";
 import {
+  DEFAULT_SEED_API_KEY,
   EVAL_TRACE_COUNT,
   FAILED_EVAL_TRACE_INTERVAL,
   SEED_CHAT_ML_PROMPTS,
@@ -28,17 +42,16 @@ import {
   generateEvalScoreId,
   generateEvalTraceId,
 } from "./utils/seed-helpers";
-
-type ConfigCategory = {
-  label: string;
-  value: number;
-};
+import { seedInAppAgentDemoConversation } from "./utils/in-app-agent-seed";
+import { seedDatasetVersions } from "./seed-dataset-versions";
 
 const options = {
   environment: { type: "string" },
 } as const;
 
 const prisma = new PrismaClient();
+const IN_APP_AGENT_SYSTEM_PROMPT_NAME = "in-app-agent-system-prompt";
+const inAppAgentSystemPrompt = IN_APP_AGENT_SYSTEM_PROMPT_TEMPLATE;
 
 async function main() {
   const environment = parseArgs({
@@ -50,12 +63,15 @@ async function main() {
   const seedUserId1 = "user-1"; // Owner of org
   const seedUserId2 = "user-2"; // Member of org, admin of project
 
+  // Seeded identities skip Cloud signup auto-enable; pin v4 on so local dx
+  // and PR previews land on the events traces view.
   const user = await prisma.user.upsert({
     where: { id: seedUserId1 },
     update: {
       name: "Demo User",
       email: "demo@langfuse.com",
       password: await hash("password", 12),
+      v4BetaEnabled: true,
     },
     create: {
       id: seedUserId1,
@@ -63,7 +79,16 @@ async function main() {
       email: "demo@langfuse.com",
       password: await hash("password", 12),
       image: "https://static.langfuse.com/langfuse-dev%2Fexample-avatar.png",
+      featureFlags: ["langfuseTopics"],
+      v4BetaEnabled: true,
     },
+  });
+  await prisma.user.updateMany({
+    where: {
+      id: seedUserId1,
+      NOT: { featureFlags: { has: "langfuseTopics" } },
+    },
+    data: { featureFlags: { push: "langfuseTopics" } },
   });
   const user2 = await prisma.user.upsert({
     where: { id: seedUserId2 },
@@ -71,12 +96,14 @@ async function main() {
       name: "Demo User 2",
       email: "member@langfuse.com",
       password: await hash("password", 12),
+      v4BetaEnabled: true,
     },
     create: {
       id: seedUserId2,
       name: "Demo User 2",
       email: "member@langfuse.com",
       password: await hash("password", 12),
+      v4BetaEnabled: true,
     },
   });
 
@@ -84,6 +111,7 @@ async function main() {
     where: { id: seedOrgId },
     update: {
       name: "Seed Org",
+      aiFeaturesEnabled: true,
       cloudConfig: {
         plan: "Team",
       },
@@ -91,6 +119,7 @@ async function main() {
     create: {
       id: seedOrgId,
       name: "Seed Org",
+      aiFeaturesEnabled: true,
       cloudConfig: {
         plan: "Team",
       },
@@ -110,10 +139,13 @@ async function main() {
     },
   });
 
+  await upsertInAppAgentSystemPrompt(project1.id);
+  await upsertNaturalLanguageFilterPrompt(project1.id);
+
   // Realistic support chat scenario
   await createSupportChatSession(project1);
 
-  await prisma.organizationMembership.upsert({
+  const orgMembership = await prisma.organizationMembership.upsert({
     where: {
       orgId_userId: {
         userId: user.id,
@@ -161,7 +193,13 @@ async function main() {
     },
   });
 
-  await prisma.prompt.upsert({
+  await seedAiGateway({
+    organizationId: seedOrgId,
+    userId: user.id,
+    orgMembershipId: orgMembership.id,
+  });
+
+  const summaryPrompt = await prisma.prompt.upsert({
     where: {
       projectId_name_version: {
         projectId: seedProjectId,
@@ -180,27 +218,32 @@ async function main() {
     update: {},
   });
 
+  await seedInAppAgentDemoConversation({
+    prisma,
+    projectId: project1.id,
+    userId: user.id,
+    summaryPrompt,
+  });
+
   const seedApiKey = {
-    id: "seed-api-key",
-    secret: process.env.SEED_SECRET_KEY ?? "sk-lf-1234567890", // eslint-disable-line turbo/no-undeclared-env-vars
-    public: "pk-lf-1234567890",
-    note: "seeded key",
+    ...DEFAULT_SEED_API_KEY,
+    secret: process.env.SEED_SECRET_KEY ?? DEFAULT_SEED_API_KEY.secret, // eslint-disable-line turbo/no-undeclared-env-vars
   };
 
-  if (!(await prisma.apiKey.findUnique({ where: { id: seedApiKey.id } }))) {
-    await prisma.apiKey.create({
-      data: {
-        note: seedApiKey.note,
-        id: seedApiKey.id,
+  if (
+    !(await prisma.apiKey.findUnique({
+      where: { publicKey: seedApiKey.public },
+    }))
+  ) {
+    await createApiKey(prisma, {
+      tenant: OrganizationId(seedOrgId),
+      scope: ProjectId(project1.id),
+      role: SystemRoleId("LEGACY_PROJECT_API_KEY"),
+      createdBy: UserId(user.id),
+      name: seedApiKey.note,
+      predefinedKeys: {
         publicKey: seedApiKey.public,
-        hashedSecretKey: await hashSecretKey(seedApiKey.secret),
-        displaySecretKey: getDisplaySecretKey(seedApiKey.secret),
-        scope: "PROJECT",
-        project: {
-          connect: {
-            id: project1.id,
-          },
-        },
+        secretKey: seedApiKey.secret,
       },
     });
   }
@@ -242,27 +285,27 @@ async function main() {
       },
       update: {},
     });
+    await upsertInAppAgentSystemPrompt(project2.id);
 
     const secondKey = {
-      id: "seed-api-key-2",
       secret: process.env.SEED_SECRET_KEY ?? "sk-lf-asdfghjkl", // eslint-disable-line turbo/no-undeclared-env-vars
       public: "pk-lf-asdfghjkl",
       note: "seeded key 2",
     };
-    if (!(await prisma.apiKey.findUnique({ where: { id: secondKey.id } }))) {
-      await prisma.apiKey.create({
-        data: {
-          note: secondKey.note,
-          id: secondKey.id,
+    if (
+      !(await prisma.apiKey.findUnique({
+        where: { publicKey: secondKey.public },
+      }))
+    ) {
+      await createApiKey(prisma, {
+        tenant: OrganizationId(seedOrgIdOrg2),
+        scope: ProjectId(project2.id),
+        role: SystemRoleId("LEGACY_PROJECT_API_KEY"),
+        createdBy: UserId(user.id),
+        name: secondKey.note,
+        predefinedKeys: {
           publicKey: secondKey.public,
-          hashedSecretKey: await hashSecretKey(secondKey.secret),
-          displaySecretKey: getDisplaySecretKey(secondKey.secret),
-          scope: "PROJECT",
-          project: {
-            connect: {
-              id: project2.id,
-            },
-          },
+          secretKey: secondKey.secret,
         },
       });
     }
@@ -298,6 +341,8 @@ async function main() {
 
     // add eval objects
     for (const evalTemplate of SEED_EVALUATOR_TEMPLATES) {
+      const evalTemplateType = evalTemplate.type as EvalTemplateType;
+
       await prisma.evalTemplate.upsert({
         where: {
           projectId_name_version: {
@@ -311,12 +356,18 @@ async function main() {
           projectId: project1.id,
           name: evalTemplate.name,
           version: evalTemplate.version,
-          prompt: evalTemplate.prompt,
-          model: evalTemplate.model,
+          type: evalTemplateType,
+          prompt: evalTemplate.prompt ?? null,
+          model: evalTemplate.model ?? null,
           vars: evalTemplate.vars,
-          provider: evalTemplate.provider,
-          outputSchema: evalTemplate.outputSchema,
-          modelParams: evalTemplate.modelParams,
+          provider: evalTemplate.provider ?? null,
+          outputDefinition: evalTemplate.outputDefinition ?? undefined,
+          modelParams: evalTemplate.modelParams ?? undefined,
+          sourceCode: evalTemplate.sourceCode ?? null,
+          sourceCodeLanguage:
+            (evalTemplate.sourceCodeLanguage as
+              | EvalTemplateSourceCodeLanguage
+              | undefined) ?? null,
         },
         update: {},
       });
@@ -332,13 +383,79 @@ async function main() {
           evalTemplateId: evalConfig.evalTemplateId,
           projectId: project1.id,
           jobType: evalConfig.jobType as any,
-          status: evalConfig.status as any,
+          status: evalConfig.status as JobConfigState,
           scoreName: evalConfig.scoreName,
           filter: evalConfig.filter,
           variableMapping: evalConfig.variableMapping,
           targetObject: evalConfig.targetObject,
           sampling: evalConfig.sampling,
           delay: evalConfig.delay,
+        },
+        update: {},
+      });
+
+      const evalTemplate = SEED_EVALUATOR_TEMPLATES.find(
+        (template) => template.id === evalConfig.evalTemplateId,
+      );
+      if (!evalTemplate) {
+        throw new Error(
+          `Missing evaluator template ${evalConfig.evalTemplateId}`,
+        );
+      }
+
+      await prisma.evaluator.upsert({
+        where: { id: evalConfig.id },
+        create: {
+          id: evalConfig.id,
+          projectId: project1.id,
+          name: evalConfig.scoreName,
+          type: evalTemplate.type as EvalTemplateType,
+        },
+        update: {},
+      });
+      await prisma.evaluatorVersion.upsert({
+        where: { id: `${evalConfig.id}:${evalTemplate.id}` },
+        create: {
+          id: `${evalConfig.id}:${evalTemplate.id}`,
+          evaluatorId: evalConfig.id,
+          version: evalTemplate.version,
+          prompt: evalTemplate.prompt ?? null,
+          model: evalTemplate.model ?? null,
+          provider: evalTemplate.provider ?? null,
+          modelParams: evalTemplate.modelParams ?? undefined,
+          vars: evalTemplate.vars,
+          variableMapping: evalConfig.variableMapping,
+          outputDefinition: evalTemplate.outputDefinition ?? undefined,
+          sourceCode: evalTemplate.sourceCode ?? null,
+          sourceCodeLanguage:
+            (evalTemplate.sourceCodeLanguage as
+              | EvalTemplateSourceCodeLanguage
+              | undefined) ?? null,
+        },
+        update: {},
+      });
+      await prisma.evaluationRule.upsert({
+        where: { id: evalConfig.id },
+        create: {
+          id: evalConfig.id,
+          projectId: project1.id,
+          name: evalConfig.scoreName,
+          status: evalConfig.status as any,
+          filter: evalConfig.filter,
+          targetObject: evalConfig.targetObject,
+          sampling: evalConfig.sampling,
+          delay: evalConfig.delay,
+        },
+        update: {},
+      });
+      await prisma.evaluationRuleEvaluatorAssignment.upsert({
+        where: { id: `legacy:${evalConfig.id}` },
+        create: {
+          id: `legacy:${evalConfig.id}`,
+          projectId: project1.id,
+          evaluationRuleId: evalConfig.id,
+          evaluatorId: evalConfig.id,
+          variableMapping: evalConfig.variableMapping,
         },
         update: {},
       });
@@ -350,6 +467,7 @@ async function main() {
     );
 
     await createDashboardsAndWidgets([project1, project2]);
+    await seedDatasetVersions(prisma, [project1.id, project2.id]);
 
     await prisma.llmSchema.createMany({
       data: [
@@ -406,6 +524,113 @@ main()
     logger.info("Disconnected from postgres and redis");
     process.exit(1);
   });
+
+async function seedAiGateway(params: {
+  organizationId: string;
+  userId: string;
+  orgMembershipId: string;
+}) {
+  // The gateway gets its own project rather than the shared seed project.
+  // Organization members do not inherit access to the ingestion project (see
+  // resolveProjectRole), so pointing the config at the seed project would take
+  // that project away from every seeded user.
+  const ingestionProjectId = "c2ba9dcb-1f39-4f2f-a4e6-1f0b6a8f5c11";
+  await prisma.project.upsert({
+    where: { id: ingestionProjectId },
+    create: {
+      id: ingestionProjectId,
+      name: "AI Gateway Ingestion",
+      orgId: params.organizationId,
+    },
+    update: { orgId: params.organizationId },
+  });
+  // Mirrors what the control plane writes when it creates the project: the
+  // creator keeps an explicit role so the project stays reachable in the UI.
+  await prisma.projectMembership.upsert({
+    where: {
+      projectId_userId: {
+        projectId: ingestionProjectId,
+        userId: params.userId,
+      },
+    },
+    create: {
+      projectId: ingestionProjectId,
+      userId: params.userId,
+      orgMembershipId: params.orgMembershipId,
+      role: "OWNER",
+    },
+    update: { orgMembershipId: params.orgMembershipId },
+  });
+  await prisma.gatewayConfig.upsert({
+    where: { organizationId: params.organizationId },
+    create: {
+      organizationId: params.organizationId,
+      defaultIngestionProjectId: ingestionProjectId,
+      ingestionMode: "FULL",
+    },
+    update: {
+      defaultIngestionProjectId: ingestionProjectId,
+    },
+  });
+
+  if (
+    (await prisma.gatewayAiConnection.count({
+      where: { organizationId: params.organizationId },
+    })) === 0
+  ) {
+    await prisma.gatewayAiConnection.createMany({
+      data: [
+        {
+          id: "seed-gateway-openai",
+          organizationId: params.organizationId,
+          name: "OpenAI production",
+          provider: "OPENAI",
+          encryptedCredential: encrypt("sk-seed-openai-not-valid"),
+          displaySecret: getDisplaySecretKey("sk-seed-openai-not-valid"),
+          createdById: params.userId,
+          status: "ENABLED",
+        },
+        {
+          id: "seed-gateway-anthropic",
+          organizationId: params.organizationId,
+          name: "Anthropic production",
+          provider: "ANTHROPIC",
+          encryptedCredential: encrypt("sk-ant-seed-not-valid"),
+          displaySecret: getDisplaySecretKey("sk-ant-seed-not-valid"),
+          createdById: params.userId,
+          status: "ENABLED",
+        },
+      ],
+    });
+  }
+
+  const publicKey = "pk-lf-gateway-seed";
+  const existingKey = await prisma.apiKey.findUnique({
+    where: { publicKey },
+    select: { id: true },
+  });
+  const key =
+    existingKey ??
+    (await createApiKey(prisma, {
+      tenant: OrganizationId(params.organizationId),
+      scope: UserId(params.userId),
+      role: SystemRoleId("AI_GATEWAY"),
+      createdBy: UserId(params.userId),
+      name: "Seeded gateway key",
+      predefinedKeys: {
+        publicKey,
+        secretKey: "sk-lf-gateway-seed",
+      },
+    }));
+  await prisma.gatewayApiKeyAssociation.upsert({
+    where: { apiKeyId: key.id },
+    create: {
+      apiKeyId: key.id,
+      metadata: { environment: "development", team: "platform" },
+    },
+    update: {},
+  });
+}
 
 async function createDashboardsAndWidgets(projects: Project[]) {
   logger.info("Creating dashboards and widgets");
@@ -525,6 +750,8 @@ export async function createDatasets(
         }));
 
       const datasetItemIds: string[] = [];
+      const itemsToCreate = [];
+
       for (let index = 0; index < data.items.length; index++) {
         const item = data.items[index];
         const sourceTraceId =
@@ -532,30 +759,38 @@ export async function createDatasets(
             ? `${Math.floor(Math.random() * 100)}`
             : undefined;
 
-        // Use upsert to prevent duplicates
-        const datasetItem = await prisma.datasetItem.upsert({
-          where: {
-            id_projectId: {
-              id: generateDatasetItemId(datasetName, index, projectId),
-              projectId,
-            },
-          },
-          create: {
-            projectId,
-            id: generateDatasetItemId(datasetName, index, projectId),
-            datasetId: dataset.id,
-            sourceTraceId: sourceTraceId ?? null,
-            sourceObservationId: null,
-            input: item.input,
-            expectedOutput: item.output,
-            metadata: Math.random() > 0.5 ? { key: "value" } : undefined,
-          },
-          update: {}, // Don't update if it exists
+        const itemId = generateDatasetItemId(datasetName, index, projectId);
+        datasetItemIds.push(itemId);
+
+        // Create dataset items in versioned format with all required fields
+        // Set validFrom to 30 days ago so experiment runs can reference this version
+        const validFrom = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        itemsToCreate.push({
+          id: itemId,
+          projectId,
+          datasetId: dataset.id,
+          sourceTraceId: sourceTraceId ?? null,
+          sourceObservationId: null,
+          input: item.input,
+          expectedOutput: item.output,
+          metadata: Math.random() > 0.5 ? { key: "value" } : undefined,
+          status: "ACTIVE" as const,
+          validFrom,
+          isDeleted: false,
         });
-        datasetItemIds.push(datasetItem.id);
+      }
+
+      // Bulk insert all items (use createMany for better performance)
+      if (itemsToCreate.length > 0) {
+        await prisma.datasetItem.createMany({
+          data: itemsToCreate,
+          skipDuplicates: true, // Skip if already exists (handles re-runs)
+        });
       }
 
       for (let datasetRunNumber = 0; datasetRunNumber < 3; datasetRunNumber++) {
+        if (!data.shouldRunExperiment) continue;
+
         await prisma.datasetRuns.upsert({
           where: {
             id_projectId: {
@@ -579,6 +814,121 @@ export async function createDatasets(
           },
           update: {},
         });
+      }
+
+      // Create multiple versions for test-dataset-versioning
+      if (datasetName === "test-dataset-versioning") {
+        const itemId = `test-version-item-${projectId.slice(-8)}`;
+        const baseTime = new Date("2025-01-20T10:00:00Z");
+
+        // Version 1: Initial version
+        const v1Time = new Date(baseTime.getTime());
+        await prisma.datasetItem.create({
+          data: {
+            id: itemId,
+            projectId,
+            datasetId: dataset.id,
+            sourceTraceId: null,
+            sourceObservationId: null,
+            input: { color: "red" },
+            expectedOutput: "#FF0000",
+            metadata: { version: "1", description: "Initial version" },
+            status: "ACTIVE",
+            validFrom: v1Time,
+            isDeleted: false,
+          },
+        });
+
+        // Version 2: Updated output (2 hours later)
+        const v2Time = new Date(baseTime.getTime() + 2 * 60 * 60 * 1000);
+        await prisma.$executeRaw`
+          UPDATE dataset_items
+          SET valid_to = ${v2Time}
+          WHERE project_id = ${projectId}
+            AND dataset_id = ${dataset.id}
+            AND id = ${itemId}
+            AND valid_from = ${v1Time}
+        `;
+
+        await prisma.datasetItem.create({
+          data: {
+            id: itemId,
+            projectId,
+            datasetId: dataset.id,
+            sourceTraceId: null,
+            sourceObservationId: null,
+            input: { color: "red" },
+            expectedOutput: "#FF0001", // Slightly different
+            metadata: {
+              version: "2",
+              description: "Fixed hex value precision",
+            },
+            status: "ACTIVE",
+            validFrom: v2Time,
+            isDeleted: false,
+          },
+        });
+
+        // Version 3: Updated input and output (1 day later)
+        const v3Time = new Date(baseTime.getTime() + 24 * 60 * 60 * 1000);
+        await prisma.$executeRaw`
+          UPDATE dataset_items
+          SET valid_to = ${v3Time}
+          WHERE project_id = ${projectId}
+            AND dataset_id = ${dataset.id}
+            AND id = ${itemId}
+            AND valid_from = ${v2Time}
+        `;
+
+        await prisma.datasetItem.create({
+          data: {
+            id: itemId,
+            projectId,
+            datasetId: dataset.id,
+            sourceTraceId: null,
+            sourceObservationId: null,
+            input: { color: "crimson" }, // Changed input
+            expectedOutput: "#DC143C",
+            metadata: {
+              version: "3",
+              description: "Changed to crimson color",
+            },
+            status: "ACTIVE",
+            validFrom: v3Time,
+            isDeleted: false,
+          },
+        });
+
+        // Version 4: Current version (2 days after initial)
+        const v4Time = new Date(baseTime.getTime() + 2 * 24 * 60 * 60 * 1000);
+        await prisma.$executeRaw`
+          UPDATE dataset_items
+          SET valid_to = ${v4Time}
+          WHERE project_id = ${projectId}
+            AND dataset_id = ${dataset.id}
+            AND id = ${itemId}
+            AND valid_from = ${v3Time}
+        `;
+
+        await prisma.datasetItem.create({
+          data: {
+            id: itemId,
+            projectId,
+            datasetId: dataset.id,
+            sourceTraceId: null,
+            sourceObservationId: null,
+            input: { color: "blue" }, // Changed to blue
+            expectedOutput: "#0000FF",
+            metadata: { version: "4", description: "Changed to blue color" },
+            status: "ACTIVE",
+            validFrom: v4Time,
+            isDeleted: false,
+          },
+        });
+
+        logger.info(
+          `Created 4 versions for test-dataset-versioning in project ${projectId}`,
+        );
       }
     }
   }
@@ -617,6 +967,7 @@ async function generateEvalJobExecutions(
             jobConfiguration.evalTemplateId!,
             i,
             project.id,
+            0,
           ),
         },
       });
@@ -636,6 +987,68 @@ async function generatePromptsForProject(projects: Project[]) {
   return promptIds;
 }
 
+async function upsertInAppAgentSystemPrompt(projectId: string) {
+  await prisma.prompt.upsert({
+    where: {
+      projectId_name_version: {
+        projectId,
+        name: IN_APP_AGENT_SYSTEM_PROMPT_NAME,
+        version: 1,
+      },
+    },
+    create: {
+      projectId,
+      createdBy: "user-1",
+      prompt: inAppAgentSystemPrompt,
+      name: IN_APP_AGENT_SYSTEM_PROMPT_NAME,
+      type: "text",
+      version: 1,
+      labels: ["production", "latest"],
+    },
+    update: {
+      prompt: inAppAgentSystemPrompt,
+      type: "text",
+      labels: ["production", "latest"],
+    },
+  });
+}
+
+// The legacy natural-language filter feature fetches this prompt from the
+// AI-features project at runtime; on self-referential deployments (previews)
+// that project is llm-app, so it must exist on the default seed path too.
+const NATURAL_LANGUAGE_FILTER_PROMPT_NAME = "get-filter-conditions-from-query";
+
+async function upsertNaturalLanguageFilterPrompt(projectId: string) {
+  const seedPrompt = SEED_PROMPT_VERSIONS.find(
+    (p) => p.name === NATURAL_LANGUAGE_FILTER_PROMPT_NAME,
+  );
+  if (!seedPrompt) return;
+
+  await prisma.prompt.upsert({
+    where: {
+      projectId_name_version: {
+        projectId,
+        name: seedPrompt.name,
+        version: seedPrompt.version,
+      },
+    },
+    create: {
+      projectId,
+      createdBy: seedPrompt.createdBy,
+      prompt: seedPrompt.prompt,
+      name: seedPrompt.name,
+      type: seedPrompt.type ?? "text",
+      version: seedPrompt.version,
+      labels: seedPrompt.labels,
+    },
+    update: {
+      prompt: seedPrompt.prompt,
+      type: seedPrompt.type ?? "text",
+      labels: seedPrompt.labels,
+    },
+  });
+}
+
 export const PROMPT_IDS: string[] = [];
 
 async function generatePrompts(project: Project) {
@@ -644,14 +1057,13 @@ async function generatePrompts(project: Project) {
     const versions = Math.floor(Math.random() * 20) + 1;
     for (let i = 1; i <= versions; i++) {
       const promptId = `prompt-${v4()}`;
-      await prisma.prompt.upsert({
+      const seededPrompt = await prisma.prompt.upsert({
         where: {
           projectId_name_version: {
             projectId: project.id,
             name: prompt.name,
             version: i,
           },
-          id: promptId,
         },
         create: {
           id: promptId,
@@ -662,18 +1074,16 @@ async function generatePrompts(project: Project) {
           version: i,
           labels: i === versions ? prompt.labels : [],
         },
-        update: {
-          id: promptId,
-        },
+        update: {},
       });
-      promptIds.push(promptId);
+      promptIds.push(seededPrompt.id);
     }
   }
 
   for (const prompt of SEED_CHAT_ML_PROMPTS) {
-    const promptId = `prompt-${v4()}`;
     const versions = Math.floor(Math.random() * 20) + 1;
     for (let i = 1; i <= versions; i++) {
+      const promptId = `prompt-${v4()}`;
       const versionAddition = [
         {
           role: "user",
@@ -681,14 +1091,13 @@ async function generatePrompts(project: Project) {
         },
       ];
 
-      await prisma.prompt.upsert({
+      const seededPrompt = await prisma.prompt.upsert({
         where: {
           projectId_name_version: {
             projectId: project.id,
             name: prompt.name,
-            version: prompt.version,
+            version: i,
           },
-          id: promptId,
         },
         create: {
           id: promptId,
@@ -701,24 +1110,21 @@ async function generatePrompts(project: Project) {
           labels: prompt.labels,
           tags: prompt.tags,
         },
-        update: {
-          id: promptId,
-        },
+        update: {},
       });
-      promptIds.push(promptId);
+      promptIds.push(seededPrompt.id);
     }
   }
 
   for (const version of SEED_PROMPT_VERSIONS) {
     const id = `prompt-${v4()}`;
-    await prisma.prompt.upsert({
+    const seededPrompt = await prisma.prompt.upsert({
       where: {
         projectId_name_version: {
           projectId: project.id,
           name: version.name,
           version: version.version,
         },
-        id: id,
       },
       create: {
         id: id,
@@ -726,15 +1132,14 @@ async function generatePrompts(project: Project) {
         createdBy: version.createdBy,
         prompt: version.prompt,
         name: version.name,
+        type: version.type ?? "text",
         config: version.config,
         version: version.version,
         labels: version.labels,
       },
-      update: {
-        id: id,
-      },
+      update: {},
     });
-    promptIds.push(id);
+    promptIds.push(seededPrompt.id);
   }
 
   return promptIds;
@@ -746,8 +1151,8 @@ async function generateConfigsForProject(projects: Project[]) {
     {
       name: string;
       id: string;
-      dataType: ScoreDataType;
-      categories: ConfigCategory[] | null;
+      dataType: ScoreDataTypeType;
+      categories: ScoreConfigCategoryDomain[] | null;
     }[]
   > = new Map();
 
@@ -796,15 +1201,15 @@ async function generateConfigs(project: Project) {
   const configNameAndId: {
     name: string;
     id: string;
-    dataType: ScoreDataType;
-    categories: ConfigCategory[] | null;
+    dataType: ScoreDataTypeType;
+    categories: ScoreConfigCategoryDomain[] | null;
   }[] = [];
 
   const configs = [
     {
       id: `config-${v4()}`,
       name: "manual-score",
-      dataType: ScoreDataType.NUMERIC,
+      dataType: ScoreDataTypeEnum.NUMERIC,
       projectId: project.id,
       isArchived: false,
     },
@@ -812,7 +1217,7 @@ async function generateConfigs(project: Project) {
       id: `config-${v4()}`,
       projectId: project.id,
       name: "Accuracy",
-      dataType: ScoreDataType.CATEGORICAL,
+      dataType: ScoreDataTypeEnum.CATEGORICAL,
       categories: [
         { label: "Incorrect", value: 0 },
         { label: "Partially Correct", value: 1 },
@@ -824,13 +1229,21 @@ async function generateConfigs(project: Project) {
       id: `config-${v4()}`,
       projectId: project.id,
       name: "Toxicity",
-      dataType: ScoreDataType.BOOLEAN,
+      dataType: ScoreDataTypeEnum.BOOLEAN,
       categories: [
         { label: "True", value: 1 },
         { label: "False", value: 0 },
       ],
       description:
         "Used to indicate if text was harmful or offensive in nature.",
+      isArchived: false,
+    },
+    {
+      id: `config-${v4()}`,
+      projectId: project.id,
+      name: "Feedback",
+      dataType: ScoreDataTypeEnum.TEXT,
+      description: "Free-form text feedback on the output quality.",
       isArchived: false,
     },
   ];
@@ -873,8 +1286,8 @@ async function generateQueuesForProject(
     {
       name: string;
       id: string;
-      dataType: ScoreDataType;
-      categories: ConfigCategory[] | null;
+      dataType: ScoreDataTypeType;
+      categories: ScoreConfigCategoryDomain[] | null;
     }[]
   >,
 ) {
@@ -897,8 +1310,8 @@ async function generateQueues(
   configIdsAndNames: {
     name: string;
     id: string;
-    dataType: ScoreDataType;
-    categories: ConfigCategory[] | null;
+    dataType: ScoreDataTypeType;
+    categories: ScoreConfigCategoryDomain[] | null;
   }[],
 ) {
   const queue = {

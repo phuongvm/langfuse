@@ -1,13 +1,26 @@
-import React, { useMemo, useCallback } from "react";
-import { PlaygroundProvider } from "../context";
+/* eslint-disable @repo/no-null-render, @typescript-eslint/no-deprecated, @typescript-eslint/no-use-before-define -- Legacy UI usage retained during migration to design-system components. */
+import React, { useMemo, useCallback, useRef, useEffect } from "react";
+import {
+  PlaygroundProvider,
+  usePlaygroundContext,
+} from "../context/PlaygroundProvider";
 import { SaveToPromptButton } from "./SaveToPromptButton";
+import { SourcePromptHeading } from "./SourcePromptHeading";
 import { Button } from "@/src/components/ui/button";
-import { Copy, X } from "lucide-react";
+import { Plus, X } from "@langfuse/icons";
 import { MULTI_WINDOW_CONFIG, type MultiWindowState } from "../types";
 import { ModelParameters } from "@/src/components/ModelParameters";
-import { usePlaygroundContext } from "../context";
 import { Messages } from "@/src/features/playground/page/components/Messages";
 import { ConfigurationDropdowns } from "@/src/features/playground/page/components/ConfigurationDropdowns";
+import { useMessageSearchActions } from "@/src/components/ChatMessages/MessageSearch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/src/components/ui/tooltip";
+import { useIsMobile } from "@/src/hooks/use-mobile";
+import { getMessagesFingerprint } from "@/src/features/playground/page/utils/messagesFingerprint";
 
 /**
  * MultiWindowPlayground Component
@@ -41,6 +54,10 @@ export default function MultiWindowPlayground({
   onRemoveWindow,
   onAddWindow,
 }: MultiWindowPlaygroundProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const prevWindowCountRef = useRef(windowState.windowIds.length);
+  const isMobile = useIsMobile();
+
   /**
    * Calculate responsive window width based on screen size and window count
    * Ensures minimum width while distributing available space equally
@@ -54,6 +71,23 @@ export default function MultiWindowPlayground({
 
     // Use CSS minmax to ensure minimum width is respected
     return `minmax(${minWidth}px, ${idealWidth})`;
+  }, [windowState.windowIds.length]);
+
+  /**
+   * Auto-scroll to the right when a new window is added (not removed)
+   */
+  useEffect(() => {
+    const currentCount = windowState.windowIds.length;
+    const prevCount = prevWindowCountRef.current;
+
+    if (currentCount > prevCount && containerRef.current) {
+      containerRef.current.scrollTo({
+        left: containerRef.current.scrollWidth,
+        behavior: "smooth",
+      });
+    }
+
+    prevWindowCountRef.current = currentCount;
   }, [windowState.windowIds.length]);
 
   /**
@@ -73,47 +107,38 @@ export default function MultiWindowPlayground({
   if (!firstWindowId) return null;
 
   return (
-    <>
-      {/* Mobile layout: single window only - visible below md breakpoint */}
-      <div className="block h-full p-4 md:hidden">
-        <PlaygroundProvider windowId={firstWindowId}>
-          <PlaygroundWindowContent
-            windowId={firstWindowId}
-            onRemove={onRemoveWindow}
-            onCopy={handleCopyWindow}
-            canRemove={false}
-            isMobile={true}
-          />
-        </PlaygroundProvider>
-      </div>
+    <div
+      ref={containerRef}
+      className="flex h-full flex-1 overflow-x-auto md:grid"
+      style={{
+        gridAutoFlow: "column",
+        gridAutoColumns: windowWidth,
+        gap: "1rem",
+        padding: "1rem",
+        scrollBehavior: "smooth",
+      }}
+    >
+      {windowState.windowIds.map((windowId, index) => {
+        const isFirstWindow = index === 0;
 
-      {/* Desktop layout: multi-window with horizontal grid - visible at md breakpoint and above */}
-      <div className="hidden h-full md:block">
-        <div
-          className="h-full overflow-x-auto"
-          style={{
-            display: "grid",
-            gridAutoFlow: "column",
-            gridAutoColumns: windowWidth,
-            gap: "1rem",
-            padding: "1rem",
-            scrollBehavior: "smooth",
-          }}
-        >
-          {windowState.windowIds.map((windowId) => (
-            <PlaygroundProvider key={windowId} windowId={windowId}>
+        return (
+          <div
+            key={windowId}
+            className={isFirstWindow ? "flex-1" : "hidden md:block"}
+          >
+            <PlaygroundProvider windowId={windowId}>
               <PlaygroundWindowContent
                 windowId={windowId}
                 onRemove={onRemoveWindow}
                 onCopy={handleCopyWindow}
                 canRemove={windowState.windowIds.length > 1}
-                isMobile={false}
+                isMobile={isMobile}
               />
             </PlaygroundProvider>
-          ))}
-        </div>
-      </div>
-    </>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -131,10 +156,21 @@ function PlaygroundWindowContent({
   onRemove: (windowId: string) => void;
   onCopy: (windowId: string) => void;
   canRemove: boolean;
-  windowCount?: number;
   isMobile?: boolean;
 }) {
   const playgroundContext = usePlaygroundContext();
+  const { registerPageTarget, unregisterPageTarget } =
+    useMessageSearchActions();
+  const windowContainerRef = useRef<HTMLDivElement | null>(null);
+  const { messages, sourcePrompt } = playgroundContext;
+
+  const isSourcePromtEdited = useMemo(
+    () =>
+      Boolean(sourcePrompt) &&
+      getMessagesFingerprint(messages) !==
+        sourcePrompt?.initialMessagesFingerprint,
+    [messages, sourcePrompt],
+  );
 
   const handleRemove = useCallback(() => {
     onRemove(windowId);
@@ -144,41 +180,77 @@ function PlaygroundWindowContent({
     onCopy(windowId);
   }, [windowId, onCopy]);
 
+  useEffect(() => {
+    registerPageTarget(windowId, {
+      pageRef: windowContainerRef,
+    });
+
+    return () => {
+      unregisterPageTarget(windowId);
+    };
+  }, [registerPageTarget, unregisterPageTarget, windowId]);
+
   return (
-    <div className="playground-window flex h-full min-w-0 flex-col rounded-lg border bg-background shadow-sm">
-      {/* Window Header */}
-      <div className="relative flex-shrink-0 border-b bg-muted/50 px-3 py-1">
-        <div className="flex items-center pr-24">
+    <div
+      ref={windowContainerRef}
+      className="playground-window bg-background @container flex h-full min-w-0 flex-col rounded-lg border shadow-xs"
+    >
+      <div className="bg-muted/50 shrink-0 border-b">
+        <div className="relative flex items-center py-1 pr-32 pl-3 @xl:pr-96">
           <div className="flex items-center gap-2">
             <ModelParameters {...playgroundContext} layout="compact" />
           </div>
 
-          <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
-            <SaveToPromptButton />
+          <div className="absolute top-1/2 right-3 flex -translate-y-1/2 items-center gap-2">
+            <TooltipProvider delayDuration={300}>
+              <SaveToPromptButton />
 
-            {/* Hide copy button on mobile */}
-            {!isMobile && (
-              <Button
-                variant="ghost"
-                onClick={handleCopy}
-                className="h-6 w-6 p-0 hover:bg-muted"
-                title="Duplicate window configuration"
-              >
-                <Copy size={14} />
-                <span className="sr-only">Copy window</span>
-              </Button>
-            )}
-            {canRemove && (
-              <Button
-                variant="ghost"
-                onClick={handleRemove}
-                className="h-6 w-6 p-0 hover:bg-destructive/10 hover:text-destructive"
-                title="Remove window"
-              >
-                <X size={14} />
-                <span className="sr-only">Remove window</span>
-              </Button>
-            )}
+              {/* Hide copy button on mobile */}
+              {!isMobile && (
+                <>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        onClick={handleCopy}
+                        className="h-7 gap-1.5 px-2.5 text-xs @xl:hidden"
+                      >
+                        <Plus size="base" color="default" />
+                        <span className="sr-only">New split window</span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent className="text-xs">
+                      New split window
+                    </TooltipContent>
+                  </Tooltip>
+                  <Button
+                    variant="outline"
+                    onClick={handleCopy}
+                    className="hidden h-7 gap-1.5 px-2.5 text-xs @xl:flex"
+                  >
+                    <Plus size="base" color="default" />
+                    <span>New split window</span>
+                  </Button>
+                </>
+              )}
+              {canRemove && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      onClick={handleRemove}
+                      className="hover:bg-destructive/10 hover:text-destructive h-6 w-6 p-0"
+                    >
+                      <X size="base" />
+                      <span className="sr-only">Remove window</span>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent className="text-xs">
+                    Remove window
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </TooltipProvider>
           </div>
         </div>
       </div>
@@ -188,7 +260,15 @@ function PlaygroundWindowContent({
         <div className="flex h-full flex-col">
           <ConfigurationDropdowns />
 
-          <div className="flex-1 overflow-auto p-4">
+          <div className="relative flex-1 overflow-auto p-4">
+            {playgroundContext.sourcePrompt && (
+              <div className="absolute top-1 flex max-w-[calc(100%-4rem)] justify-end">
+                <SourcePromptHeading
+                  sourcePrompt={playgroundContext.sourcePrompt}
+                  isEdited={isSourcePromtEdited}
+                />
+              </div>
+            )}
             <Messages {...playgroundContext} />
           </div>
         </div>

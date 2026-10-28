@@ -1,8 +1,9 @@
 import { prisma } from "@langfuse/shared/src/db";
 import { logger } from "@langfuse/shared/src/server";
-import { organizationNameSchema } from "@/src/features/organizations/utils/organizationNameSchema";
-import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { organizationNameSchema } from "@/src/features/organizations/server";
+import { auditLog } from "@/src/features/audit-logs/server";
 import { type NextApiRequest, type NextApiResponse } from "next";
+import { z } from "zod";
 
 export async function handleGetOrganizations(
   req: NextApiRequest,
@@ -14,12 +15,25 @@ export async function handleGetOrganizations(
       name: true,
       createdAt: true,
       metadata: true,
+      projects: {
+        select: {
+          id: true,
+          name: true,
+          metadata: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        where: {
+          deletedAt: null,
+        },
+      },
     },
   });
   return res.status(200).json({
     organizations: organizations.map((org) => ({
       ...org,
       metadata: org.metadata ?? {},
+      projects: org.projects,
     })),
   });
 }
@@ -28,13 +42,14 @@ export async function handleCreateOrganization(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
-  // Validate the request body using the organizationNameSchema
-  const validationResult = organizationNameSchema.safeParse(req.body);
+  const validationResult = z
+    .object({ name: organizationNameSchema })
+    .safeParse(req.body);
 
   if (!validationResult.success) {
     res.status(400).json({
       error: "Invalid request body",
-      details: validationResult.error.format(),
+      details: z.formatError(validationResult.error),
     });
     return;
   }
@@ -58,6 +73,24 @@ export async function handleCreateOrganization(
       name,
       metadata,
     },
+    select: {
+      id: true,
+      name: true,
+      createdAt: true,
+      metadata: true,
+      projects: {
+        select: {
+          id: true,
+          name: true,
+          metadata: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        where: {
+          deletedAt: null,
+        },
+      },
+    },
   });
 
   // Log the organization creation
@@ -78,5 +111,6 @@ export async function handleCreateOrganization(
     name: organization.name,
     createdAt: organization.createdAt,
     metadata: organization.metadata ?? {},
+    projects: organization.projects,
   });
 }

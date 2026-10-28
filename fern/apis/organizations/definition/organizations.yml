@@ -14,7 +14,7 @@ service:
       errors:
         - commons.UnauthorizedError
         - commons.MethodNotAllowedError
-    
+
     create:
       docs: Create a new organization
       method: POST
@@ -32,7 +32,7 @@ service:
         - commons.Error
         - commons.UnauthorizedError
         - commons.MethodNotAllowedError
-    
+
     getById:
       docs: Get organization by ID
       method: GET
@@ -44,7 +44,7 @@ service:
         - commons.Error
         - commons.UnauthorizedError
         - commons.MethodNotAllowedError
-    
+
     update:
       docs: Update an organization
       method: PUT
@@ -64,7 +64,7 @@ service:
         - commons.Error
         - commons.UnauthorizedError
         - commons.MethodNotAllowedError
-    
+
     delete:
       docs: Delete an organization
       method: DELETE
@@ -100,9 +100,18 @@ service:
         name: CreateApiKeyRequest
         body:
           properties:
+            name:
+              type: optional<string>
+              docs: Optional name for the API key. Cannot be provided together with note, even if either value is an empty string.
             note:
               type: optional<string>
-              docs: Optional note for the API key
+              availability:
+                status: deprecated
+                message: Use name instead.
+              docs: Deprecated alias for name. Cannot be provided together with name, even if either value is an empty string.
+            expiresAt:
+              type: optional<nullable<datetime>>
+              docs: Optional expiration timestamp in ISO 8601 format. Must be in the future. Omit or set to null for a key that does not expire.
       response: ApiKeyResponse
       errors:
         - commons.Error
@@ -137,6 +146,18 @@ types:
       metadata:
         type: map<string, unknown>
         docs: Metadata for the organization
+      projects: list<OrganizationProject>
+
+  OrganizationProject:
+    docs: Project belonging to an organization
+    properties:
+      id: string
+      name: string
+      metadata:
+        type: optional<map<string, unknown>>
+        docs: Metadata for the project
+      createdAt: datetime
+      updatedAt: datetime
 
   DeleteOrganizationResponse:
     docs: Response for successful organization deletion
@@ -153,9 +174,19 @@ types:
     properties:
       id: string
       createdAt: datetime
-      expiresAt: optional<datetime>
+      expiresAt:
+        type: optional<datetime>
+        docs: Expiration timestamp. Null if the key does not expire.
       lastUsedAt: optional<datetime>
-      note: optional<string>
+      name:
+        type: optional<nullable<string>>
+        docs: Name of the API key. Contains the same value as note; null if no name was provided.
+      note:
+        type: optional<string>
+        availability:
+          status: deprecated
+          message: Use name instead.
+        docs: Deprecated alias for name. Contains the same value as name.
       publicKey: string
       displaySecretKey: string
 
@@ -164,7 +195,18 @@ types:
     properties:
       id: string
       createdAt: datetime
+      expiresAt:
+        type: optional<nullable<datetime>>
+        docs: Expiration timestamp. Null if the key does not expire.
       publicKey: string
       secretKey: string
       displaySecretKey: string
-      note: optional<string>
+      name:
+        type: optional<nullable<string>>
+        docs: Name of the API key. Contains the same value as note; null if no name was provided.
+      note:
+        type: optional<string>
+        availability:
+          status: deprecated
+          message: Use name instead.
+        docs: Deprecated alias for name. Contains the same value as name.

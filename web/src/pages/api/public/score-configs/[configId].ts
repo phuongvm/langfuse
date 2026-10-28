@@ -1,40 +1,42 @@
 import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import {
+  getScoreConfig,
+  updateScoreConfig,
+} from "@/src/features/public-api/server/score-configs-api-service";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import {
   GetScoreConfigQuery,
   GetScoreConfigResponse,
-  InternalServerError,
-  LangfuseNotFoundError,
-} from "@langfuse/shared";
-import { prisma } from "@langfuse/shared/src/db";
-import { traceException } from "@langfuse/shared/src/server";
+  PutScoreConfigBody as PatchScoreConfigBody,
+  PutScoreConfigQuery as PatchScoreConfigQuery,
+  PutScoreConfigResponse as PatchScoreConfigResponse,
+} from "@/src/features/public-api/types/score-configs";
 
 export default withMiddlewares({
   GET: createAuthedProjectAPIRoute({
     name: "Get a Score Config",
+    action: "scoreConfigs:read",
     querySchema: GetScoreConfigQuery,
     responseSchema: GetScoreConfigResponse,
     fn: async ({ query, auth }) => {
-      const config = await prisma.scoreConfig.findUnique({
-        where: {
-          id: query.configId,
-          projectId: auth.scope.projectId,
-        },
+      return await getScoreConfig({
+        projectId: auth.scope.projectId,
+        configId: query.configId,
       });
-
-      if (!config) {
-        throw new LangfuseNotFoundError(
-          "Score config not found within authorized project",
-        );
-      }
-
-      const parsedConfig = GetScoreConfigResponse.safeParse(config);
-      if (!parsedConfig.success) {
-        traceException(parsedConfig.error);
-        throw new InternalServerError("Requested score config is corrupted");
-      }
-
-      return parsedConfig.data;
+    },
+  }),
+  PATCH: createAuthedProjectAPIRoute({
+    name: "Update a Score Config",
+    action: "scoreConfigs:CUD",
+    querySchema: PatchScoreConfigQuery,
+    bodySchema: PatchScoreConfigBody,
+    responseSchema: PatchScoreConfigResponse,
+    fn: async ({ query, body, auth }) => {
+      return await updateScoreConfig({
+        context: auth.scope,
+        configId: query.configId,
+        body,
+      });
     },
   }),
 });

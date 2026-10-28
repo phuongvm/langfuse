@@ -1,4 +1,3 @@
-import { api } from "@/src/utils/api";
 import { type FilterState } from "@langfuse/shared";
 import { createTracesTimeFilter } from "@/src/features/dashboard/lib/dashboard-utils";
 import {
@@ -6,14 +5,18 @@ import {
   dashboardDateRangeAggregationSettings,
 } from "@/src/utils/date-range-utils";
 import React, { useMemo } from "react";
-import { DashboardCategoricalScoreAdapter } from "@/src/features/scores/adapters";
-import { type ScoreData } from "@/src/features/scores/types";
-import { CategoricalChart } from "@/src/features/scores/components/ScoreChart";
 import {
-  type QueryType,
-  mapLegacyUiTableFilterToView,
-} from "@/src/features/query";
+  DashboardCategoricalScoreAdapter,
+  type ScoreData,
+} from "@/src/features/scores";
+import { type QueryType, type ViewVersion } from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
 import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { Chart } from "@/src/features/widgets";
+import { scoreChartDataToDataPoints } from "@/src/features/dashboard/lib/chart-data-adapters";
+import { isEmptyChart } from "@/src/features/dashboard/lib/score-analytics-utils";
+import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
+import { useScheduledDashboardExecuteQuery } from "@/src/features/dashboard/hooks/DashboardQuerySchedulerProvider";
 
 export function CategoricalScoreChart(props: {
   projectId: string;
@@ -22,6 +25,8 @@ export function CategoricalScoreChart(props: {
   fromTimestamp: Date;
   toTimestamp: Date;
   agg?: DashboardDateRangeAggregationOption;
+  metricsVersion: ViewVersion;
+  schedulerId?: string;
 }) {
   const scoresQuery: QueryType = {
     view: "scores-categorical",
@@ -62,10 +67,11 @@ export function CategoricalScoreChart(props: {
     orderBy: null,
   };
 
-  const scores = api.dashboard.executeQuery.useQuery(
+  const scores = useScheduledDashboardExecuteQuery(
     {
       projectId: props.projectId,
       query: scoresQuery,
+      version: props.metricsVersion,
     },
     {
       trpc: {
@@ -73,6 +79,7 @@ export function CategoricalScoreChart(props: {
           skipBatch: true,
         },
       },
+      queryId: `${props.schedulerId ?? "home:score-analytics"}:categorical:${props.scoreData.source}:${props.scoreData.name}:${props.agg ?? "aggregate"}`,
     },
   );
 
@@ -91,13 +98,25 @@ export function CategoricalScoreChart(props: {
     return adapter.toChartData();
   }, [scores.data, props.agg]);
 
+  if (isEmptyChart({ data: chartData })) {
+    return (
+      <NoDataOrLoading
+        isLoading={scores.isLoading}
+        className="min-h-36 flex-1"
+      />
+    );
+  }
   return (
-    <CategoricalChart
-      chartData={chartData}
-      chartLabels={chartLabels}
-      isLoading={scores.isLoading}
-      className="min-h-[9rem] flex-1"
-      stack={!!props.agg}
-    />
+    <div className="h-80 w-full shrink-0">
+      <Chart
+        chartType="VERTICAL_BAR"
+        data={scoreChartDataToDataPoints(chartData, chartLabels)}
+        rowLimit={100}
+        chartConfig={{
+          type: "VERTICAL_BAR",
+          row_limit: 100,
+        }}
+      />
+    </div>
   );
 }

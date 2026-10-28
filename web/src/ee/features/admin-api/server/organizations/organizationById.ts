@@ -1,11 +1,14 @@
 import { type NextApiRequest, type NextApiResponse } from "next";
 import { prisma } from "@langfuse/shared/src/db";
-import { logger } from "@langfuse/shared/src/server";
-import { organizationNameSchema } from "@/src/features/organizations/utils/organizationNameSchema";
-import { auditLog } from "@/src/features/audit-logs/auditLog";
-import { z } from "zod/v4";
+import {
+  invalidateCachedOrgApiKeys,
+  logger,
+} from "@langfuse/shared/src/server";
+import { organizationNameSchema } from "@/src/features/organizations/server";
+import { auditLog } from "@/src/features/audit-logs/server";
+import { z } from "zod";
 
-export const validateQueryAndExtractId = (query: unknown): string | null => {
+const validateQueryAndExtractId = (query: unknown): string | null => {
   const inputQuerySchema = z.object({
     organizationId: z.string(),
   });
@@ -32,6 +35,18 @@ export async function handleGetOrganizationById(
       name: true,
       createdAt: true,
       metadata: true,
+      projects: {
+        select: {
+          id: true,
+          name: true,
+          metadata: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        where: {
+          deletedAt: null,
+        },
+      },
     },
   });
 
@@ -42,6 +57,7 @@ export async function handleGetOrganizationById(
   return res.status(200).json({
     ...organization,
     metadata: organization.metadata ?? {},
+    projects: organization.projects,
   });
 }
 
@@ -54,12 +70,14 @@ export async function handleUpdateOrganization(
     return res.status(400).json({ error: "Invalid organization ID" });
   }
 
-  const validationResult = organizationNameSchema.safeParse(req.body);
+  const validationResult = z
+    .object({ name: organizationNameSchema })
+    .safeParse(req.body);
 
   if (!validationResult.success) {
     return res.status(400).json({
       error: "Invalid request body",
-      details: validationResult.error.format(),
+      details: z.formatError(validationResult.error),
     });
   }
 
@@ -89,6 +107,24 @@ export async function handleUpdateOrganization(
   const updatedOrganization = await prisma.organization.update({
     where: { id: organizationId },
     data: { name, metadata },
+    select: {
+      id: true,
+      name: true,
+      createdAt: true,
+      metadata: true,
+      projects: {
+        select: {
+          id: true,
+          name: true,
+          metadata: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        where: {
+          deletedAt: null,
+        },
+      },
+    },
   });
 
   // Log the update
@@ -110,6 +146,7 @@ export async function handleUpdateOrganization(
     name: updatedOrganization.name,
     createdAt: updatedOrganization.createdAt,
     metadata: updatedOrganization.metadata ?? {},
+    projects: updatedOrganization.projects,
   });
 }
 
@@ -131,18 +168,40 @@ export async function handleDeleteOrganization(
     return res.status(404).json({ error: "Organization not found" });
   }
 
-  // Check if organization has any projects
-  const projectCount = await prisma.project.count({
-    where: { orgId: organizationId },
+  // count non-deleted projects
+  const countNonDeletedProjects = await prisma.project.count({
+    where: {
+      orgId: organizationId,
+      deletedAt: null,
+    },
   });
 
-  if (projectCount > 0) {
+  // count all projects (including soft-deleted)
+  const countAllProjects = await prisma.project.count({
+    where: {
+      orgId: organizationId,
+    },
+  });
+
+  if (countNonDeletedProjects > 0) {
     return res.status(400).json({
       error: "Cannot delete organization with existing projects",
       message:
         "Please delete or transfer all projects before deleting the organization.",
     });
   }
+
+  if (countAllProjects > 0) {
+    return res.status(400).json({
+      error: "Cannot delete organization with existing projects",
+      message:
+        "Deletion of your projects is still being processed, please try deleting the organization later",
+    });
+  }
+
+  // Evict before the delete: ApiKey.organization cascades, so keys are gone
+  // by the time a post-delete eviction would run and it would find nothing.
+  await invalidateCachedOrgApiKeys(organizationId);
 
   // Delete the organization
   const deletedOrganization = await prisma.organization.delete({

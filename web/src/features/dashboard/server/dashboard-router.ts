@@ -1,4 +1,4 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   createTRPCRouter,
   protectedProjectProcedure,
@@ -6,9 +6,11 @@ import {
 import {
   filterInterface,
   sqlInterface,
+  type DatabaseRow,
 } from "@/src/server/api/services/sqlInterface";
 import { createHistogramData } from "@/src/features/dashboard/lib/score-analytics-utils";
 import { TRPCError } from "@trpc/server";
+import { env } from "@/src/env.mjs";
 import {
   getScoreAggregate,
   getNumericScoreHistogram,
@@ -18,27 +20,40 @@ import {
   getObservationUsageByTypeByTime,
   DashboardService,
   DashboardDefinitionSchema,
+  escapeSqlLikePattern,
 } from "@langfuse/shared/src/server";
-import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { executeQuery } from "@langfuse/shared/query/server";
 import {
-  type QueryType,
   query as customQuery,
-} from "@/src/features/query/types";
+  validateQuery,
+  viewVersions,
+  type QueryType,
+} from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
 import {
   paginationZod,
   orderBy,
   StringNoHTML,
   InvalidRequestError,
-  singleFilter,
+  singleFilterList,
+  LANGFUSE_HOME_DASHBOARD_ID,
+  type FilterState,
 } from "@langfuse/shared";
-import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { executeQuery } from "@/src/features/query/server/queryExecutor";
+import { throwIfNoProjectAccess } from "@/src/features/rbac";
 
 // Define the dashboard list input schema
 const ListDashboardsInput = z.object({
   projectId: z.string(),
   ...paginationZod,
-  orderBy: orderBy,
+  // The Home-dashboard picker and clone detection fetch the whole list in one
+  // page, so allow a higher ceiling than the default table pagination.
+  limit: z.coerce.number().int().positive().lte(500).default(50),
+  orderBy: orderBy.refine(
+    (value) =>
+      value === null ||
+      ["name", "createdAt", "updatedAt"].includes(value.column),
+    { message: "Invalid dashboard sort column", path: ["column"] },
+  ),
 });
 
 // Get dashboard by ID input schema
@@ -73,14 +88,244 @@ const CreateDashboardInput = z.object({
 const CloneDashboardInput = z.object({
   projectId: z.string(),
   dashboardId: z.string(),
+  // Optional definition override so an edit attempted on a read-only
+  // dashboard (e.g. a tile moved on the curated Home) carries into the clone.
+  definition: DashboardDefinitionSchema.optional(),
+  // Set the clone as the project's home dashboard in the same gesture.
+  setAsHome: z.boolean().optional(),
+});
+
+// Set home dashboard input schema
+const SetHomeDashboardInput = z.object({
+  projectId: z.string(),
+  // null resets to the Langfuse-curated default
+  dashboardId: z.string().min(1).nullable(),
 });
 
 // Update dashboard filters input schema
 const UpdateDashboardFiltersInput = z.object({
   projectId: z.string(),
   dashboardId: z.string(),
-  filters: z.array(singleFilter),
+  filters: singleFilterList,
 });
+
+/**
+ * First free clone name: "ABC (Clone)", then "ABC (Clone 2)", "ABC (Clone 3)", …
+ */
+function nextCloneName(sourceName: string, existingNames: string[]): string {
+  const taken = new Set(existingNames);
+  const base = `${sourceName} (Clone)`;
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${sourceName} (Clone ${n})`)) n++;
+  return `${sourceName} (Clone ${n})`;
+}
+
+// Map camelCase legacy column names (used by scoreHistogram component)
+// to view-native field names before passing through the general mapper.
+const LEGACY_CAMEL_CASE_MAP: Record<string, string> = {
+  scoreName: "name",
+  scoreSource: "source",
+  scoreDataType: "dataType",
+};
+
+/**
+ * Shared filter preparation for scores-numeric v2 queries.
+ * Extracts time boundaries, strips time filters, and maps legacy UI column
+ * names to view-native field names.
+ */
+function prepareScoresNumericV2Params(filter: FilterState) {
+  const [from, to] = extractFromAndToTimestampsFromFilter(filter);
+  // Preserve the existing default range. DateTimeFilter now accepts epoch as a
+  // lower bound, but widening dashboard queries is a separate behavior change.
+  const fromIso = from?.value
+    ? new Date(from.value as Date).toISOString()
+    : new Date("2000-01-01T00:00:00.000Z").toISOString();
+  const toIso = to?.value
+    ? new Date(to.value as Date).toISOString()
+    : new Date().toISOString();
+  const nonTimeFilters = filter.filter(
+    (f) => f.column !== "scoreTimestamp" && f.column !== "startTime",
+  );
+  const normalizedFilters = nonTimeFilters.map((f) => {
+    const mapped = LEGACY_CAMEL_CASE_MAP[f.column];
+    return mapped ? { ...f, column: mapped } : f;
+  });
+
+  const mappedFilters = mapLegacyUiTableFilterToView(
+    "scores-numeric",
+    normalizedFilters,
+  );
+  return { fromIso, toIso, mappedFilters };
+}
+
+/**
+ * Converts ClickHouse histogram(N)(...) output to the { chartData, chartLabels }
+ * shape returned by createHistogramData (used by the NumericScoreHistogram component).
+ *
+ * ClickHouse histogram() returns an Array(Tuple(Float64, Float64, Float64))
+ * where each tuple is (lower_bound, upper_bound, count).
+ * The result column is named "histogram_value" by QueryBuilder
+ * (pattern: `${aggregation}_${alias}`).
+ */
+function clickhouseHistogramToChartData(
+  result: Array<Record<string, unknown>>,
+): {
+  chartData: Array<{ binLabel: string; count: number }>;
+  chartLabels: string[];
+} {
+  if (result.length > 0 && !("histogram_value" in result[0])) {
+    throw new Error(
+      `Expected histogram_value column in QueryBuilder result, got: ${Object.keys(result[0]).join(", ")}`,
+    );
+  }
+  const histogramBins = result[0]?.histogram_value as
+    | Array<[number, number, number]>
+    | undefined;
+  if (!histogramBins?.length) return { chartData: [], chartLabels: [] };
+
+  const round = (v: number) => parseFloat(v.toFixed(2));
+  return {
+    chartLabels: ["count"],
+    chartData: histogramBins.map(([lower, upper, count]) => ({
+      binLabel: `[${round(lower)}, ${round(upper)}]`,
+      count: Math.round(count),
+    })),
+  };
+}
+
+async function getScoreAggregateV2({
+  projectId,
+  filter,
+}: {
+  projectId: string;
+  filter: FilterState;
+}): Promise<DatabaseRow[]> {
+  // prepareScoresNumericV2Params also applies LEGACY_CAMEL_CASE_MAP for
+  // scoreHistogram callers. For score-aggregate calls, the only camelCase
+  // column is "scoreTimestamp" which is stripped as a time filter before
+  // LEGACY_CAMEL_CASE_MAP runs, making the normalization step a no-op here.
+  const { fromIso, toIso, mappedFilters } =
+    prepareScoresNumericV2Params(filter);
+
+  // Non-time filters in their original form — used for categorical query
+  // filter mapping and value filter detection below.
+  const nonTimeFilters = filter.filter(
+    (f) => f.column !== "scoreTimestamp" && f.column !== "startTime",
+  );
+
+  const baseQuery = {
+    dimensions: [{ field: "name" }, { field: "source" }, { field: "dataType" }],
+    timeDimension: null,
+    fromTimestamp: fromIso,
+    toTimestamp: toIso,
+    orderBy: [{ field: "sum_count", direction: "desc" as const }],
+  };
+
+  const numericQuery: QueryType = {
+    ...baseQuery,
+    view: "scores-numeric",
+    metrics: [
+      { measure: "count", aggregation: "sum" },
+      { measure: "value", aggregation: "avg" },
+    ],
+    filters: mappedFilters,
+  };
+
+  // The scores-categorical view has no "value" dimension, so we handle value
+  // filters manually: categorical scores always have value=0 in ClickHouse, so
+  // value=0 should include all categoricals, while any other value filter
+  // (e.g. value=1) should exclude them. This matches v1 behavior where numeric
+  // and categorical scores are queried together in a single SQL statement.
+  const valueFilter = nonTimeFilters.find((f) => f.column === "value");
+  const skipCategorical =
+    valueFilter && "value" in valueFilter && valueFilter.value !== 0;
+  const categoricalFilters = nonTimeFilters.filter((f) => f.column !== "value");
+
+  const categoricalQuery: QueryType = {
+    ...baseQuery,
+    view: "scores-categorical",
+    metrics: [{ measure: "count", aggregation: "sum" }],
+    filters: mapLegacyUiTableFilterToView(
+      "scores-categorical",
+      categoricalFilters,
+    ),
+  };
+
+  const [numericResults, categoricalResults] = await Promise.all([
+    executeQuery(projectId, numericQuery, "v2"),
+    skipCategorical
+      ? Promise.resolve([])
+      : executeQuery(projectId, categoricalQuery, "v2"),
+  ]);
+
+  const merged = [
+    ...numericResults.map((r) => ({
+      scoreName: String(r.name),
+      countScoreId: Number(r.sum_count ?? 0),
+      avgValue: Number(r.avg_value ?? 0),
+      scoreSource: String(r.source),
+      scoreDataType: String(r.dataType),
+    })),
+    ...categoricalResults.map((r) => ({
+      scoreName: String(r.name),
+      countScoreId: Number(r.sum_count ?? 0),
+      avgValue: 0,
+      scoreSource: String(r.source),
+      scoreDataType: String(r.dataType),
+    })),
+  ].sort((a, b) => b.countScoreId - a.countScoreId);
+
+  return merged as DatabaseRow[];
+}
+
+async function getObservationsByTypeV2(params: {
+  projectId: string;
+  filter: FilterState;
+  dimensionField: "costType" | "usageType";
+  metricMeasure: "costByType" | "usageByType";
+}): Promise<DatabaseRow[]> {
+  const { projectId, filter, dimensionField, metricMeasure } = params;
+
+  const [from, to] = extractFromAndToTimestampsFromFilter(filter);
+  if (!from?.value || !to?.value) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Time filter required",
+    });
+  }
+
+  // Filter normalisation for the executeQuery (v2) path:
+  //
+  const nonDatetimeFilters = filter.filter((f) => f.type !== "datetime");
+  // mapLegacyUiTableFilterToView normalizes legacy dashboard filters whether
+  // they arrive as display labels, uiTableIds, or explicit aliases.
+  const viewFilters = mapLegacyUiTableFilterToView(
+    "observations",
+    nonDatetimeFilters,
+  );
+
+  const q: QueryType = {
+    view: "observations",
+    dimensions: [{ field: dimensionField }],
+    metrics: [{ measure: metricMeasure, aggregation: "sum" }],
+    filters: viewFilters,
+    timeDimension: { granularity: "auto" },
+    fromTimestamp: new Date(from.value as Date).toISOString(),
+    toTimestamp: new Date(to.value as Date).toISOString(),
+    orderBy: null,
+  };
+
+  const rows = await executeQuery(projectId, q, "v2", true);
+
+  // Transform flat rows to { intervalStart, key, sum } expected by the component.
+  const sumField = `sum_${metricMeasure}`;
+  return rows.map((row) => ({
+    intervalStart: new Date(row["time_dimension"] as string),
+    key: row[dimensionField] as string,
+    sum: Number(row[sumField] ?? 0),
+  })) as DatabaseRow[];
+}
 
 export const dashboardRouter = createTRPCRouter({
   chart: protectedProjectProcedure
@@ -88,11 +333,11 @@ export const dashboardRouter = createTRPCRouter({
       sqlInterface.extend({
         projectId: z.string(),
         filter: filterInterface.optional(),
+        version: viewVersions.optional().default("v1"),
         queryName: z
           .enum([
             // Current score table is weird and does not fit into new model. Keep around as is until we decide what to do with it.
             "score-aggregate",
-            // Cost by type and usage by type are currently not supported in the new data model.
             "observations-usage-by-type-timeseries",
             "observations-cost-by-type-timeseries",
           ])
@@ -102,7 +347,7 @@ export const dashboardRouter = createTRPCRouter({
     .query(async ({ input }) => {
       const [from, to] = extractFromAndToTimestampsFromFilter(input.filter);
 
-      if (from.value > to.value) {
+      if (from.value && to.value && from.value > to.value) {
         logger.error(
           `from > to, returning empty result: from=${from}, to=${to}`,
         );
@@ -111,6 +356,12 @@ export const dashboardRouter = createTRPCRouter({
 
       switch (input.queryName) {
         case "score-aggregate":
+          if (input.version === "v2") {
+            return getScoreAggregateV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
+            });
+          }
           const scores = await getScoreAggregate(
             input.projectId,
             input.filter ?? [],
@@ -123,12 +374,28 @@ export const dashboardRouter = createTRPCRouter({
             countScoreId: Number(row.count),
           })) as DatabaseRow[];
         case "observations-usage-by-type-timeseries":
+          if (input.version === "v2") {
+            return getObservationsByTypeV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
+              dimensionField: "usageType",
+              metricMeasure: "usageByType",
+            });
+          }
           const rowsObsType = await getObservationUsageByTypeByTime(
             input.projectId,
             input.filter ?? [],
           );
           return rowsObsType as DatabaseRow[];
         case "observations-cost-by-type-timeseries":
+          if (input.version === "v2") {
+            return getObservationsByTypeV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
+              dimensionField: "costType",
+              metricMeasure: "costByType",
+            });
+          }
           const rowsObsCostByType = await getObservationCostByTypeByTime(
             input.projectId,
             input.filter ?? [],
@@ -146,9 +413,35 @@ export const dashboardRouter = createTRPCRouter({
       sqlInterface.extend({
         projectId: z.string(),
         filter: filterInterface.optional(),
+        version: viewVersions.optional().default("v1"),
       }),
     )
     .query(async ({ input }) => {
+      if (input.version === "v2") {
+        // v2: ClickHouse histogram() aggregates all matching rows server-side.
+        // `input.limit` is ignored — no row-level cap is needed.
+        const { fromIso, toIso, mappedFilters } = prepareScoresNumericV2Params(
+          input.filter ?? [],
+        );
+        const histogramQuery: QueryType = {
+          view: "scores-numeric",
+          dimensions: [],
+          metrics: [{ measure: "value", aggregation: "histogram" }],
+          filters: mappedFilters,
+          fromTimestamp: fromIso,
+          toTimestamp: toIso,
+          timeDimension: null,
+          orderBy: null,
+          chartConfig: { type: "HISTOGRAM", bins: 10 },
+        };
+        const result = await executeQuery(
+          input.projectId,
+          histogramQuery,
+          "v2",
+        );
+        return clickhouseHistogramToChartData(result);
+      }
+
       const data = await getNumericScoreHistogram(
         input.projectId,
         input.filter ?? [],
@@ -161,33 +454,52 @@ export const dashboardRouter = createTRPCRouter({
       z.object({
         projectId: z.string(),
         query: customQuery,
+        // Required on purpose: a client must decide the read path explicitly.
+        // An implicit v1 default let unresolved-session clients silently fire
+        // legacy-table queries for v4 users.
+        version: viewVersions,
       }),
     )
     .query(async ({ input }) => {
+      // Deployment-level guard, not a per-user one: v2 reads the events
+      // views, which exist whenever the deployment writes them. Monitors
+      // previews and shared v2-widgets legitimately query v2 for users whose
+      // own read path is still v3; only a legacy deployment has nothing for
+      // v2 to read. v1 stays open (saved v1 widgets render for v4 users).
+      if (
+        input.version === "v2" &&
+        env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "legacy"
+      ) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "v2 queries are not available on this deployment",
+        });
+      }
       try {
-        return executeQuery(input.projectId, input.query as QueryType);
+        const validation = validateQuery(input.query, input.version);
+        if (!validation.valid) {
+          throw new InvalidRequestError(validation.reason);
+        }
+
+        return executeQuery(
+          input.projectId,
+          input.query,
+          input.version,
+          input.version === "v2",
+        );
       } catch (error) {
-        // If the error is a known invalid request, return a 400 error
         if (error instanceof InvalidRequestError) {
           logger.warn("Bad request in query execution", error, {
             projectId: input.projectId,
             query: input.query,
           });
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: error.message || "Invalid request",
-            cause: error,
-          });
+          throw error;
         }
         logger.error("Error executing query", error, {
           projectId: input.projectId,
           query: input.query,
         });
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Failed to execute query",
-          cause: error,
-        });
+        throw error;
       }
     }),
 
@@ -314,16 +626,106 @@ export const dashboardRouter = createTRPCRouter({
         });
       }
 
-      // Create a new dashboard with the same data but modified name
+      // Create a new dashboard with the same data but a numbered clone name
+      const existingClones = await ctx.prisma.dashboard.findMany({
+        where: {
+          projectId: input.projectId,
+          name: {
+            startsWith: `${escapeSqlLikePattern(sourceDashboard.name)} (Clone`,
+          },
+        },
+        select: { name: true },
+      });
+
       const clonedDashboard = await DashboardService.createDashboard(
         input.projectId,
-        `${sourceDashboard.name} (Clone)`,
+        nextCloneName(
+          sourceDashboard.name,
+          existingClones.map((d) => d.name),
+        ),
         sourceDashboard.description,
         ctx.session.user.id,
-        sourceDashboard.definition,
+        input.definition ?? sourceDashboard.definition,
       );
 
+      if (input.setAsHome) {
+        await ctx.prisma.project.update({
+          where: { id: input.projectId },
+          data: { homeDashboardId: clonedDashboard.id },
+        });
+      }
+
       return clonedDashboard;
+    }),
+
+  getHomeDashboard: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:read",
+      });
+
+      const project = await ctx.prisma.project.findUnique({
+        where: { id: input.projectId },
+        select: { homeDashboardId: true },
+      });
+
+      // Resolve the pointer; a missing/foreign target silently falls back to
+      // the Langfuse-curated default (like an unset pointer).
+      const pointedDashboard = project?.homeDashboardId
+        ? await DashboardService.getDashboard(
+            project.homeDashboardId,
+            input.projectId,
+          )
+        : null;
+
+      const dashboard =
+        pointedDashboard ??
+        (await DashboardService.getDashboard(
+          LANGFUSE_HOME_DASHBOARD_ID,
+          input.projectId,
+        ));
+
+      return {
+        // null only when the curated row is also absent — the client then
+        // renders from the shared constant.
+        dashboard,
+        homeDashboardId: pointedDashboard
+          ? (project?.homeDashboardId ?? null)
+          : null,
+      };
+    }),
+
+  setHomeDashboard: protectedProjectProcedure
+    .input(SetHomeDashboardInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      if (input.dashboardId) {
+        const dashboard = await DashboardService.getDashboard(
+          input.dashboardId,
+          input.projectId,
+        );
+        if (!dashboard) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "Dashboard not found",
+          });
+        }
+      }
+
+      await ctx.prisma.project.update({
+        where: { id: input.projectId },
+        data: { homeDashboardId: input.dashboardId },
+      });
+
+      return { success: true };
     }),
 
   updateDashboardFilters: protectedProjectProcedure

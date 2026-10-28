@@ -2,31 +2,29 @@ import { createNextApiHandler } from "@trpc/server/adapters/next";
 import { createTRPCContext } from "@/src/server/api/trpc";
 import { appRouter } from "@/src/server/api/root";
 import { env } from "@/src/env.mjs";
-import { logger, traceException } from "@langfuse/shared/src/server";
+import { reportTRPCError } from "@/src/server/utils/trpc-utils";
 
 export const config = {
   maxDuration: 240,
+  api: {
+    bodyParser: {
+      sizeLimit: "4.5mb",
+    },
+  },
 };
 
 // export API handler
 export default createNextApiHandler({
   router: appRouter,
   createContext: createTRPCContext,
-  onError: ({ path, error }) => {
-    if (error.code === "NOT_FOUND" || error.code === "UNAUTHORIZED") {
-      logger.info(
-        `tRPC route failed on ${path ?? "<no-path>"}: ${error.message}`,
-        error,
-      );
-    } else {
-      logger.error(
-        `tRPC route failed on ${path ?? "<no-path>"}: ${error.message}`,
-        error,
-      );
-    }
-    traceException(error);
-    return error;
-  },
+  // Allow queries to be sent as POST. The client does this for `*.batchIO`
+  // I/O queries (opt-in via `sendAsPostOption`) and for any query whose
+  // serialized GET URL would exceed `MAX_TRPC_GET_URL_BYTES` (wide filters,
+  // per-row id lists). This flag is handler-wide (tRPC has no per-procedure
+  // option), but it only widens the accepted method for queries (read-only);
+  // mutations remain POST-only, so the GET-mutation protection is unchanged.
+  allowMethodOverride: true,
+  onError: reportTRPCError,
   responseMeta() {
     return {
       headers: {

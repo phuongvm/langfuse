@@ -1,23 +1,35 @@
-import z from "zod/v4";
+import z from "zod";
 
 import { BatchExport } from "@prisma/client";
 
-import { singleFilter } from "../../interfaces/filters";
+import { singleFilterList } from "../../interfaces/filters";
 import { orderBy } from "../../interfaces/orderBy";
 import { BatchTableNames } from "../../interfaces/tableNames";
-import { TracingSearchType } from "../../interfaces/search";
+import {
+  hasValidTracingSearchTypes,
+  TRACING_SEARCH_TYPE_REQUIRED_MESSAGE,
+  TracingSearchType,
+} from "../../interfaces/search";
 
 export enum BatchExportStatus {
-  QUEUED = "QUEUED", // eslint-disable-line no-unused-vars
-  PROCESSING = "PROCESSING", // eslint-disable-line no-unused-vars
-  COMPLETED = "COMPLETED", // eslint-disable-line no-unused-vars
-  FAILED = "FAILED", // eslint-disable-line no-unused-vars
+  QUEUED = "QUEUED",
+  PROCESSING = "PROCESSING",
+  COMPLETED = "COMPLETED",
+  FAILED = "FAILED",
+  CANCELLED = "CANCELLED",
 }
 
+/** Interval at which the worker refreshes a running export's updatedAt. */
+export const BATCH_EXPORT_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Age after which an untouched QUEUED/PROCESSING export stops blocking its user's next one. */
+export const BATCH_EXPORT_ABANDONED_AFTER_MS =
+  3 * BATCH_EXPORT_HEARTBEAT_INTERVAL_MS;
+
 export enum BatchExportFileFormat {
-  JSON = "JSON", // eslint-disable-line no-unused-vars
-  CSV = "CSV", // eslint-disable-line no-unused-vars
-  JSONL = "JSONL", // eslint-disable-line no-unused-vars
+  JSON = "JSON",
+  CSV = "CSV",
+  JSONL = "JSONL",
 }
 
 // Use shared BatchTableNames enum for consistency across batch operations
@@ -32,24 +44,54 @@ export const exportOptions: Record<
     fileType: string;
   }
 > = {
-  CSV: { label: "CSV", extension: "csv", fileType: "text/csv" },
-  JSON: { label: "JSON", extension: "json", fileType: "application/json" },
+  CSV: { label: "CSV", extension: "csv", fileType: "text/csv; charset=utf-8" },
+  JSON: {
+    label: "JSON",
+    extension: "json",
+    fileType: "application/json; charset=utf-8",
+  },
   JSONL: {
     label: "JSONL",
     extension: "jsonl",
-    fileType: "application/x-ndjson",
+    fileType: "application/x-ndjson; charset=utf-8",
   },
 } as const;
 
-export const BatchExportQuerySchema = z.object({
-  tableName: z.enum(BatchTableNames),
-  filter: z.array(singleFilter).nullable(),
-  searchQuery: z.string().optional(),
-  searchType: z.array(TracingSearchType).optional(),
-  orderBy,
-  limit: z.number().optional(),
-  page: z.number().optional(),
-});
+export const BatchExportQuerySchema = z
+  .object({
+    tableName: z.enum(BatchTableNames),
+    filter: singleFilterList.nullable(),
+    searchQuery: z.string().optional(),
+    searchType: z.array(TracingSearchType).optional(),
+    orderBy,
+    limit: z.number().optional(),
+    page: z.number().optional(),
+    // Snapshotted at dispatch time from the user's v4 beta flag. When true, the
+    // sessions export reads from the ClickHouse events table instead of the
+    // legacy traces path. Persisted in the job's query column so the worker reads
+    // the snapshot, never the live user record.
+    useEventsTable: z.boolean().optional(),
+  })
+  // Reject `datasets` at runtime, not by narrowing the `tableName` enum:
+  // BatchExportQueryType is shared with the batch-action read stream (which
+  // handles every table), so a narrowed type breaks the worker typecheck.
+  .superRefine((query, ctx) => {
+    if (!hasValidTracingSearchTypes(query)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["searchType"],
+        message: TRACING_SEARCH_TYPE_REQUIRED_MESSAGE,
+      });
+    }
+
+    if (query.tableName === BatchTableNames.Datasets) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["tableName"],
+        message: "datasets cannot be exported",
+      });
+    }
+  });
 
 export type BatchExportQueryType = z.infer<typeof BatchExportQuerySchema>;
 

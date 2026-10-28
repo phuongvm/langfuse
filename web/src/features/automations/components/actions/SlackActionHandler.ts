@@ -8,9 +8,10 @@ import {
   type ActionCreate,
   type ActionDomain,
 } from "@langfuse/shared";
-import { z } from "zod/v4";
+import { z } from "zod";
 
 // Define the form schema for Slack actions
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Used via z.infer
 const SlackActionFormSchema = z.object({
   slack: z.object({
     channelId: z.string().min(1, "Channel is required"),
@@ -21,9 +22,7 @@ const SlackActionFormSchema = z.object({
 
 type SlackActionFormData = z.infer<typeof SlackActionFormSchema>;
 
-export class SlackActionHandler
-  implements BaseActionHandler<SlackActionFormData>
-{
+export class SlackActionHandler implements BaseActionHandler<SlackActionFormData> {
   actionType = "SLACK" as const;
 
   getDefaultValues(automation?: AutomationDomain): SlackActionFormData {

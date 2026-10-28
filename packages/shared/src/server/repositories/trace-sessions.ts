@@ -1,6 +1,17 @@
-import z from "zod/v4";
+import z from "zod";
 import { prisma } from "../../db";
 import { singleFilter } from "../../interfaces/filters";
+
+/**
+ * Session ids come from ClickHouse, whose strings may contain NUL bytes.
+ * Postgres text cannot, and rejects any query that binds one, so such a
+ * session can never have a trace_sessions row. Check before querying.
+ */
+export const isStorableTraceSessionId = (sessionId: string) =>
+  !sessionId.includes("\u0000");
+
+export const storableTraceSessionIds = (sessionIds: string[]) =>
+  sessionIds.filter(isStorableTraceSessionId);
 
 export const getPublicSessionsFilter = async (
   projectId: string,
@@ -9,7 +20,9 @@ export const getPublicSessionsFilter = async (
   // Theoretically we should also filter the sessions by environment here. As this would return a huge list that's probably not feasible.
   // I.e. we only perform the environment check on the ClickHouse queries.
 
-  const sessionsBookmarkedFilter = filter?.find((f) => f.column === "⭐️");
+  const sessionsBookmarkedFilter = filter?.find(
+    (f) => f.column === "⭐️" || f.column === "bookmarked",
+  );
 
   let additionalBookmarkFilter: z.infer<typeof singleFilter>[] = [];
   if (sessionsBookmarkedFilter) {
@@ -65,7 +78,10 @@ export const getPublicSessionsFilter = async (
   }
 
   return filter
-    ? [...filter.filter((f) => f.column !== "⭐️"), ...additionalBookmarkFilter]
+    ? [
+        ...filter.filter((f) => f.column !== "⭐️" && f.column !== "bookmarked"),
+        ...additionalBookmarkFilter,
+      ]
     : [...additionalBookmarkFilter];
 };
 

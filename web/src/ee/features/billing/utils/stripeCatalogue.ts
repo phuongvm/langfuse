@@ -16,6 +16,10 @@ type StripeProduct = {
     price: string;
     usagePrice: string;
     mainFeatures: string[];
+    cta?: {
+      label: string;
+      href: string;
+    };
   } | null;
 };
 
@@ -32,7 +36,7 @@ export const stripeProducts: StripeProduct[] = [
       description:
         "Great to get started for most projects with unlimited users and 90 days data access.",
       price: "$29 / month",
-      usagePrice: "$8-6/100k units (100k included, graduated pricing)",
+      usagePrice: "$8-6* per 100k units",
       mainFeatures: [
         "90 days data access",
         "Unlimited users",
@@ -52,11 +56,12 @@ export const stripeProducts: StripeProduct[] = [
       description:
         "For projects that scale and need unlimited data access, high rate limits, and Slack support.",
       price: "$199 / month",
-      usagePrice: "$8-6/100k units (100k included, graduated pricing)",
+      usagePrice: "$8-6* per 100k units",
       mainFeatures: [
         "Everything in Core",
-        "Unlimited data access",
+        "3 years data access",
         "Unlimited annotation queues",
+        "Data retention management",
         "High rate limits",
         "SOC2, ISO27001 reports",
       ],
@@ -72,13 +77,12 @@ export const stripeProducts: StripeProduct[] = [
       title: "Pro + Teams Add-on",
       description: "Organizational and security controls for larger teams.",
       price: "$499 / month",
-      usagePrice: "$8-6/100k units (100k included, graduated pricing)",
+      usagePrice: "$8-6* per 100k units",
       mainFeatures: [
         "Everything in Pro",
         "Enterprise SSO (e.g. Okta)",
         "SSO enforcement",
         "Fine-grained RBAC",
-        "Data retention management",
         "Support via Slack",
       ],
     },
@@ -88,11 +92,31 @@ export const stripeProducts: StripeProduct[] = [
       ? "prod_STnXok7GSSDmyF" // sandbox
       : "prod_STnXok7GSSDmyF", // live
     mappedPlan: "cloud:enterprise",
-    checkout: null,
+    orderKey: 2499,
+    checkout: {
+      title: "Enterprise",
+      description:
+        "For large scale teams. Enterprise-grade support and security.",
+      price: "$2499 / month",
+      usagePrice: "$8-6* per 100k units",
+      mainFeatures: [
+        "Everything in Pro + Teams",
+        "Audit Logs",
+        "SCIM API",
+        "Custom rate limits",
+        "Uptime SLA",
+        "Support SLA",
+        "Dedicated support engineer",
+      ],
+      cta: {
+        label: "Contact Sales",
+        href: "https://langfuse.com/talk-to-us",
+      },
+    },
   },
 ];
 
-export const stripeUsageProduct = {
+const stripeUsageProduct = {
   id: isTestEnvironment
     ? "prod_T2DaIcLiiR78rs" // sandbox
     : "prod_T4nLLI2vn876J2",
@@ -115,7 +139,7 @@ export const isUpgrade = (
   return (oldProduct?.orderKey ?? 0) < (newProduct?.orderKey ?? 0);
 };
 
-export const isValidCheckoutProduct = (id: string) => {
+const isValidCheckoutProduct = (id: string) => {
   return stripeProducts.some(
     (p) => Boolean(p.checkout) && p.stripeProductId === id,
   );

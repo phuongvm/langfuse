@@ -1,5 +1,5 @@
 import { Transform, type TransformCallback } from "stream";
-import { stringify } from "./stringify";
+import { stringify } from "../../../utils/stringify";
 
 export function transformStreamToJson(): Transform {
   let isFirstElement = true;
@@ -9,7 +9,7 @@ export function transformStreamToJson(): Transform {
 
     transform(
       row: any,
-      encoding: BufferEncoding, // eslint-disable-line no-unused-vars
+      encoding: BufferEncoding,
       callback: TransformCallback,
     ): void {
       if (isFirstElement) {

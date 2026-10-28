@@ -1,19 +1,32 @@
-import { useMemo, useState, useEffect, useRef, useCallback } from "react";
+/* eslint-disable no-nested-ternary, react/no-unstable-nested-components, @typescript-eslint/no-use-before-define */
+/* eslint-disable @repo/no-style-props */
+import React, {
+  useMemo,
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  memo,
+} from "react";
 import { cn } from "@/src/utils/tailwind";
 import { deepParseJson } from "@langfuse/shared";
+import { decodeUnicodeInJson } from "@/src/utils/decodeUnicodeInJson";
 import { Skeleton } from "@/src/components/ui/skeleton";
-import { type MediaReturnType } from "@/src/features/media/validation";
+import { type MediaReturnType } from "@/src/features/media";
 import { LangfuseMediaView } from "@/src/components/ui/LangfuseMediaView";
-import { MarkdownJsonViewHeader } from "@/src/components/ui/MarkdownJsonView";
+import { IOSection, type IOSectionAction } from "@/src/components/ui/IOSection";
+import { useCollapsibleSystemPrompt } from "@/src/hooks/useCollapsibleSystemPrompt";
 import { copyTextToClipboard } from "@/src/utils/clipboard";
 import { JSONView } from "@/src/components/ui/CodeJsonViewer";
 import { Button } from "@/src/components/ui/button";
+import { useClickWithoutSelection } from "@/src/hooks/useClickWithoutSelection";
 import {
   ChevronDown,
   ChevronRight,
   UnfoldVertical,
   FoldVertical,
-} from "lucide-react";
+  type IconComponent,
+} from "@langfuse/icons";
 import {
   useReactTable,
   getCoreRowModel,
@@ -26,24 +39,22 @@ import { type LangfuseColumnDef } from "@/src/components/table/types";
 
 // Custom expanded state type that allows false ("user intentionally collapsed all")
 type LangfuseExpandedState = ExpandedState | false;
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/src/components/ui/table";
 import { ChatMlArraySchema } from "@/src/components/schemas/ChatMlSchema";
 import { MarkdownView } from "@/src/components/ui/MarkdownViewer";
+import {
+  filterAlreadyRenderedMedia,
+  getRenderedInlineMediaIds,
+  getStandaloneMediaReferenceStrings,
+} from "@/src/components/ui/markdown-media.utils";
 import {
   StringOrMarkdownSchema,
   containsAnyMarkdown,
 } from "@/src/components/schemas/MarkdownSchema";
-import { MARKDOWN_RENDER_CHARACTER_LIMIT } from "@/src/utils/constants";
+
+import { useMarkdownRenderCharacterLimit } from "@/src/hooks/useMarkdownRenderCharacterLimit";
 import {
   convertRowIdToKeyPath,
-  getRowChildren,
+  getSmartExpansionState,
   type JsonTableRow,
   transformJsonToTableData,
 } from "@/src/components/table/utils/jsonExpansionUtils";
@@ -51,25 +62,58 @@ import {
   ValueCell,
   getValueStringLength,
 } from "@/src/components/table/ValueCell";
+import { ItemBadge, type LangfuseItemType } from "@/src/components/ItemBadge";
+import { isLargeRenderString } from "@/src/components/ui/largeStringGate";
+import { LargeStringFallback } from "@/src/components/ui/LargeStringFallback";
 
-// Constants for table layout
 const INDENTATION_PER_LEVEL = 16;
-const INDENTATION_BASE = 8;
-const BUTTON_WIDTH = 16;
-const MARGIN_LEFT_1 = 4;
-const CELL_PADDING_X = 8; // px-2
+const INDENTATION_BASE = 12;
+const KEY_CLASSES = "text-muted-foreground font-mono text-xs/5 wrap-break-word";
+const CELL_CLASSES =
+  "border-border/60 py-1 pr-2 pl-1 align-top whitespace-normal";
 
 // Constants for smart expansion logic
+// Used for nested objects to control smart expansion depth
 const DEFAULT_MAX_ROWS = 20;
-const DEEPEST_DEFAULT_EXPANSION_LEVEL = 10;
+// Used for root-level objects where user has no parent to expand from. Therefore,
+// set higher to ensure objects like metadata with many keys are still displayed
+const DEFAULT_MAX_ROWS_IF_ROOT = 100;
 
 const MAX_CELL_DISPLAY_CHARS = 2000;
 
-const ASSISTANT_TITLES = ["assistant", "Output", "model"];
-const SYSTEM_TITLES = ["system", "Input"];
+const PREVIEW_TEXT_CLASSES = "text-gray-500 dark:text-gray-400";
 
-const MONO_TEXT_CLASSES = "font-mono text-xs break-words";
-const PREVIEW_TEXT_CLASSES = "italic text-gray-500 dark:text-gray-400";
+type PrettyJsonViewTone = "danger" | "warning" | "muted" | "neutral";
+
+// decodeUnicodeInJson was extracted to a standalone module so that other JSON
+// viewers (e.g. CodeJsonViewer) can reuse it without creating an import cycle.
+// Re-exported here for backward compatibility with existing imports and tests.
+export {
+  decodeUnicodeInJson,
+  DECODE_UNICODE_MAX_NODES,
+  DECODE_UNICODE_MAX_DEPTH,
+} from "@/src/utils/decodeUnicodeInJson";
+
+function shouldShowValue(value: unknown, showNullValues: boolean): boolean {
+  if (showNullValues) return true;
+  return value !== null && value !== "" && value !== 0;
+}
+
+function filterTableRows(
+  rows: JsonTableRow[],
+  showNullValues: boolean,
+): JsonTableRow[] {
+  if (showNullValues) return rows;
+
+  return rows
+    .filter((row) => shouldShowValue(row.value, showNullValues))
+    .map((row) => ({
+      ...row,
+      subRows: row.subRows
+        ? filterTableRows(row.subRows, showNullValues)
+        : row.subRows,
+    }));
+}
 
 function getEmptyValueDisplay(value: unknown): string | null {
   if (value === null) return "null";
@@ -86,19 +130,20 @@ function getEmptyValueDisplay(value: unknown): string | null {
   return null;
 }
 
+/** Borderless bodies sit inside a section box, which owns fill and inset. */
 function getContainerClasses(
-  title: string | undefined,
   scrollable: boolean | undefined,
   codeClassName: string | undefined,
-  baseClasses = "whitespace-pre-wrap break-words p-3 text-xs",
+  baseClasses = "whitespace-pre-wrap wrap-break-word p-3 text-xs",
+  borderless = false,
 ) {
   return cn(
     baseClasses,
-    ASSISTANT_TITLES.includes(title || "")
-      ? "bg-accent-light-green dark:border-accent-dark-green"
-      : "",
-    SYSTEM_TITLES.includes(title || "") ? "bg-primary-foreground" : "",
-    scrollable ? "" : "rounded-sm border",
+    borderless
+      ? "rounded-md overflow-clip p-0"
+      : scrollable
+        ? ""
+        : "rounded-sm border",
     codeClassName,
   );
 }
@@ -109,14 +154,15 @@ function isChatMLFormat(json: unknown): boolean {
   if (Array.isArray(json)) {
     const directArray = ChatMlArraySchema.safeParse(json);
     if (directArray.success) {
-      // had some false positives, so we really check for role/content to validate ChatML
-      const hasRoleOrContent = json.some(
+      // had some false positives, so we really check for role AND content to validate ChatML
+      const hasRoleAndContent = json.some(
         (item) =>
           typeof item === "object" &&
           item !== null &&
-          ("role" in item || "content" in item),
+          "role" in item &&
+          "content" in item,
       );
-      return hasRoleOrContent;
+      return hasRoleAndContent;
     }
   }
 
@@ -133,12 +179,15 @@ function isChatMLFormat(json: unknown): boolean {
   return false;
 }
 
-function isMarkdownContent(json: unknown): {
+function isMarkdownContent(
+  json: unknown,
+  characterLimit: number,
+): {
   isMarkdown: boolean;
   content?: string;
 } {
   const contentSize = JSON.stringify(json || {}).length;
-  if (contentSize > MARKDOWN_RENDER_CHARACTER_LIMIT) {
+  if (contentSize > characterLimit) {
     return { isMarkdown: false };
   }
 
@@ -219,69 +268,6 @@ function generateAllChildrenRecursively(
   }
 }
 
-function findOptimalExpansionLevel(
-  data: JsonTableRow[],
-  maxRows: number,
-): number {
-  if (data.length > maxRows) {
-    return 0;
-  }
-
-  function findOptimalRecursively(
-    rows: JsonTableRow[],
-    currentLevel: number,
-    cumulativeCount: number,
-    visitedData = new WeakSet(),
-  ): number {
-    const rowsAtThisLevel = rows.length;
-    const newCumulativeCount = cumulativeCount + rowsAtThisLevel;
-
-    // If expanding to this level exceeds maxRows, return previous level
-    if (newCumulativeCount > maxRows) {
-      return currentLevel - 1;
-    }
-
-    if (currentLevel >= DEEPEST_DEFAULT_EXPANSION_LEVEL) {
-      return currentLevel;
-    }
-
-    // Get all children for next level
-    const childRows: JsonTableRow[] = [];
-
-    for (const row of rows) {
-      if (row.hasChildren && row.rawChildData) {
-        if (typeof row.rawChildData !== "object" || row.rawChildData === null) {
-          continue; // Skip non-objects
-        }
-
-        // Skip if we've already processed this exact data to prevent cycles
-        if (visitedData.has(row.rawChildData)) {
-          continue;
-        }
-
-        // Mark data as visited
-        visitedData.add(row.rawChildData);
-
-        const children = getRowChildren(row);
-        childRows.push(...children);
-      }
-    }
-
-    if (childRows.length === 0) {
-      return currentLevel;
-    }
-
-    return findOptimalRecursively(
-      childRows,
-      currentLevel + 1,
-      newCumulativeCount,
-      visitedData,
-    );
-  }
-
-  return Math.max(0, findOptimalRecursively(data, 0, 0));
-}
-
 function handleRowExpansion(
   row: Row<JsonTableRow>,
   onLazyLoadChildren?: (rowId: string) => void,
@@ -309,6 +295,80 @@ function handleRowExpansion(
   }
 }
 
+interface JsonTableRowProps {
+  row: Row<JsonTableRow>;
+  rowIndex: number;
+  topLevelRowRef?: React.RefObject<HTMLTableRowElement | null>;
+  onLazyLoadChildren?: (rowId: string) => void;
+  expandedCells: Set<string>;
+  toggleCellExpansion: (cellId: string) => void;
+  stickyTopLevelKey: boolean;
+}
+
+const JsonTableRowComponent = memo(
+  ({
+    row,
+    rowIndex,
+    topLevelRowRef,
+    onLazyLoadChildren,
+    expandedCells,
+    toggleCellExpansion,
+    stickyTopLevelKey,
+  }: JsonTableRowProps) => {
+    // Hook is now at top level of this component ✅
+    const isExpandable =
+      row.original.hasChildren ||
+      getValueStringLength(row.original.value) > MAX_CELL_DISPLAY_CHARS;
+
+    const { props: rowClickProps } = useClickWithoutSelection({
+      onClick: () => {
+        handleRowExpansion(
+          row,
+          onLazyLoadChildren,
+          expandedCells,
+          toggleCellExpansion,
+        );
+      },
+      enabled: isExpandable,
+    });
+
+    return (
+      <tr
+        ref={
+          rowIndex === 0 && row.original.level === 0
+            ? topLevelRowRef
+            : undefined
+        }
+        data-observation-id={row.id}
+        {...rowClickProps}
+        className={cn(
+          "hover:bg-muted/50 data-[state=selected]:bg-muted border-b transition-colors",
+          isExpandable ? "cursor-pointer" : "",
+          row.original.level === 0 && stickyTopLevelKey
+            ? "bg-background sticky top-0 z-10 shadow-xs"
+            : "",
+        )}
+      >
+        {row.getVisibleCells().map((cell) => (
+          <td
+            key={cell.id}
+            className={cn(
+              "h-full border-b [:last-child_>_&]:border-b-0",
+              CELL_CLASSES,
+              cell.column.id === "value" && "[&>div]:wrap-anywhere",
+            )}
+            style={{ width: `${cell.column.columnDef.size}%` }}
+          >
+            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+          </td>
+        ))}
+      </tr>
+    );
+  },
+);
+
+JsonTableRowComponent.displayName = "JsonTableRow";
+
 function JsonPrettyTable({
   data,
   expandAllRef,
@@ -321,9 +381,12 @@ function JsonPrettyTable({
   smartDefaultsLevel,
   expandedCells,
   toggleCellExpansion,
+  stickyTopLevelKey = false,
+  showObservationTypeBadge = false,
+  rowActions,
 }: {
   data: JsonTableRow[];
-  expandAllRef?: React.MutableRefObject<(() => void) | null>;
+  expandAllRef?: React.RefObject<(() => void) | null>;
   onExpandStateChange?: (allExpanded: boolean) => void;
   noBorder?: boolean;
   expanded: ExpandedState;
@@ -335,71 +398,143 @@ function JsonPrettyTable({
   smartDefaultsLevel?: number | null;
   expandedCells: Set<string>;
   toggleCellExpansion: (cellId: string) => void;
+  stickyTopLevelKey?: boolean;
+  showObservationTypeBadge?: boolean;
+  rowActions?: React.ComponentProps<typeof ValueCell>["rowActions"];
+  /** Drop the Path / Value header row. */
 }) {
-  const columns: LangfuseColumnDef<JsonTableRow, unknown>[] = [
-    {
-      accessorKey: "key",
-      header: "Path",
-      size: 35,
-      cell: ({ row }) => {
-        // we need to calculate the indentation here for a good line break
-        // because of the padding, we don't know when to break the line otherwise
-        const indentationWidth =
-          row.original.level * INDENTATION_PER_LEVEL + INDENTATION_BASE;
-        const buttonWidth = row.original.hasChildren ? BUTTON_WIDTH : 0;
-        const availableTextWidth = `calc(100% - ${indentationWidth + buttonWidth + CELL_PADDING_X + MARGIN_LEFT_1}px)`;
+  const topLevelRowRef = useRef<HTMLTableRowElement>(null);
+  const [topLevelRowHeight, setTopLevelRowHeight] = useState(32);
+
+  useEffect(() => {
+    if (stickyTopLevelKey && topLevelRowRef.current) {
+      setTopLevelRowHeight(topLevelRowRef.current.offsetHeight);
+    }
+  }, [stickyTopLevelKey, data, expanded]);
+
+  const indentationWidthFor = (row: Row<JsonTableRow>) =>
+    row.original.level * INDENTATION_PER_LEVEL + INDENTATION_BASE;
+
+  const renderKeyText = (key: string) =>
+    key.includes(".")
+      ? key.split(".").map((segment, index, segments) => (
+          <span key={index}>
+            {segment}
+            {index < segments.length - 1 && (
+              <>
+                .<wbr />
+              </>
+            )}
+          </span>
+        ))
+      : key;
+
+  const renderKey = (row: Row<JsonTableRow>) => {
+    const indentationWidth = indentationWidthFor(row);
+
+    const itemBadgeType =
+      showObservationTypeBadge &&
+      row.original.level === 0 &&
+      row.original.value &&
+      typeof row.original.value === "object" &&
+      !Array.isArray(row.original.value) &&
+      "type" in row.original.value &&
+      typeof (row.original.value as any).type === "string" &&
+      (row.original.value as any).type
+        ? ((row.original.value as any).type as LangfuseItemType)
+        : null;
+
+    return (
+      <div className="flex w-max max-w-[40cqw] min-w-40 items-start gap-1 text-xs/5 wrap-break-word">
+        <div
+          className="flex h-[1lh] shrink-0 items-center justify-end"
+          style={{ width: `${indentationWidth}px` }}
+        >
+          {row.original.hasChildren ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={`${row.getIsExpanded() ? "Collapse" : "Expand"} ${row.original.key}`}
+              aria-expanded={row.getIsExpanded()}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRowExpansion(
+                  row,
+                  onLazyLoadChildren,
+                  expandedCells,
+                  toggleCellExpansion,
+                );
+              }}
+              className="text-muted-foreground hover:text-foreground h-4 w-4 p-0 hover:bg-transparent"
+            >
+              {row.getIsExpanded() ? (
+                <ChevronDown size="base" color="default" />
+              ) : (
+                <ChevronRight size="base" color="default" />
+              )}
+            </Button>
+          ) : null}
+        </div>
+        <span className={cn("min-w-0 cursor-text", KEY_CLASSES)}>
+          {itemBadgeType && (
+            <span className="mr-1 inline-block align-middle">
+              <ItemBadge type={itemBadgeType} isSmall={true} />
+            </span>
+          )}
+          {renderKeyText(row.original.key)}
+        </span>
+      </div>
+    );
+  };
+
+  const renderValue = (row: Row<JsonTableRow>) => (
+    <ValueCell
+      row={row}
+      expandedCells={expandedCells}
+      toggleCellExpansion={toggleCellExpansion}
+      preserveStringWhitespace={row.original.key === "code_eval_source_code"}
+      rowActions={rowActions}
+    />
+  );
+
+  const keyColumn: LangfuseColumnDef<JsonTableRow, unknown> = {
+    accessorKey: "key",
+    header: "Path",
+    size: 1,
+    cell: ({ row }) => {
+      const content = renderKey(row);
+      const valueLength = getValueStringLength(row.original.value);
+      const isLongValue = valueLength > MAX_CELL_DISPLAY_CHARS / 3; // already long if we don't truncate
+
+      if (isLongValue) {
+        // Offset by the section header where the host pins it (--io-header-h).
+        const headerOffset = "var(--io-header-h, 0px)";
+        let topPosition = headerOffset;
+        if (stickyTopLevelKey && row.original.level !== 0) {
+          topPosition = `calc(${headerOffset} + ${topLevelRowHeight}px)`;
+        }
 
         return (
-          <div className="flex items-start break-words">
-            <div
-              className="flex flex-shrink-0 items-center justify-end"
-              style={{ width: `${indentationWidth}px` }}
-            >
-              {row.original.hasChildren && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleRowExpansion(
-                      row,
-                      onLazyLoadChildren,
-                      expandedCells,
-                      toggleCellExpansion,
-                    );
-                  }}
-                  className="h-4 w-4 p-0"
-                >
-                  {row.getIsExpanded() ? (
-                    <ChevronDown className="h-3 w-3" />
-                  ) : (
-                    <ChevronRight className="h-3 w-3" />
-                  )}
-                </Button>
-              )}
-            </div>
-            <span
-              className={`ml-1 ${MONO_TEXT_CLASSES} font-medium`}
-              style={{ maxWidth: availableTextWidth }}
-            >
-              {row.original.key}
-            </span>
+          <div className="sticky z-5 -my-1 py-1" style={{ top: topPosition }}>
+            {content}
           </div>
         );
-      },
+      }
+
+      return content;
     },
-    {
-      accessorKey: "value",
-      header: "Value",
-      size: 65,
-      cell: ({ row }) => (
-        <ValueCell
-          row={row}
-          expandedCells={expandedCells}
-          toggleCellExpansion={toggleCellExpansion}
-        />
-      ),
-    },
+  };
+
+  const valueColumn: LangfuseColumnDef<JsonTableRow, unknown> = {
+    accessorKey: "value",
+    header: "Value",
+    size: 99,
+    cell: ({ row }) => renderValue(row),
+  };
+
+  const columns: LangfuseColumnDef<JsonTableRow, unknown>[] = [
+    keyColumn,
+    valueColumn,
   ];
 
   const table = useReactTable({
@@ -436,7 +571,7 @@ function JsonPrettyTable({
   const expandRowsWithLazyLoading = useCallback(
     (
       rowFilter: (rows: Row<JsonTableRow>[]) => Row<JsonTableRow>[],
-      shouldCollapse: boolean = false,
+      shouldCollapse = false,
     ) => {
       if (shouldCollapse) {
         onExpandedChange({});
@@ -515,99 +650,182 @@ function JsonPrettyTable({
 
   return (
     <div className={cn("w-full", !noBorder && "rounded-sm border")}>
-      <Table>
-        <TableHeader>
-          {table.getHeaderGroups().map((headerGroup) => (
-            <TableRow key={headerGroup.id}>
-              {headerGroup.headers.map((header) => (
-                <TableHead
-                  key={header.id}
-                  className="h-8 bg-transparent px-2 py-1"
-                  style={{ width: `${header.column.columnDef.size}%` }}
-                >
-                  {header.isPlaceholder
-                    ? null
-                    : flexRender(
-                        header.column.columnDef.header,
-                        header.getContext(),
-                      )}
-                </TableHead>
-              ))}
-            </TableRow>
-          ))}
-        </TableHeader>
-        <TableBody>
-          {table.getRowModel().rows.map((row) => (
-            <TableRow
+      <table className="w-full table-auto caption-bottom border-separate border-spacing-0 space-y-4 overflow-auto text-sm">
+        <thead className="sr-only">
+          <tr>
+            <th scope="col">Path</th>
+            <th scope="col">Value</th>
+          </tr>
+        </thead>
+        <tbody className="text-xs [&_tr:last-child]:border-0">
+          {table.getRowModel().rows.map((row, rowIndex) => (
+            <JsonTableRowComponent
               key={row.id}
-              onClick={() =>
-                handleRowExpansion(
-                  row,
-                  onLazyLoadChildren,
-                  expandedCells,
-                  toggleCellExpansion,
-                )
+              row={row}
+              rowIndex={rowIndex}
+              topLevelRowRef={
+                rowIndex === 0 && row.original.level === 0
+                  ? topLevelRowRef
+                  : undefined
               }
-              className={
-                row.original.hasChildren ||
-                (!row.original.hasChildren &&
-                  row.original.type !== "array" &&
-                  row.original.type !== "object" &&
-                  getValueStringLength(row.original.value) >
-                    MAX_CELL_DISPLAY_CHARS)
-                  ? "cursor-pointer"
-                  : ""
-              }
-            >
-              {row.getVisibleCells().map((cell) => (
-                <TableCell
-                  key={cell.id}
-                  className="whitespace-normal px-2 py-1"
-                  style={{ width: `${cell.column.columnDef.size}%` }}
-                >
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </TableCell>
-              ))}
-            </TableRow>
+              onLazyLoadChildren={onLazyLoadChildren}
+              expandedCells={expandedCells}
+              toggleCellExpansion={toggleCellExpansion}
+              stickyTopLevelKey={stickyTopLevelKey}
+            />
           ))}
-        </TableBody>
-      </Table>
+        </tbody>
+      </table>
     </div>
   );
 }
 
 export function PrettyJsonView(props: {
   json?: unknown;
+  parsedJson?: unknown; // Pre-parsed data (optional, from useParsedObservation hook)
   title?: string;
+  titleIcon?: IconComponent;
+  /** Drop the Path / Value header row. */
   className?: string;
   isLoading?: boolean;
+  isParsing?: boolean;
   codeClassName?: string;
   collapseStringsAfterLength?: number | null;
   media?: MediaReturnType[];
   scrollable?: boolean;
-  projectIdForPromptButtons?: string;
-  controlButtons?: React.ReactNode;
+  /** Section header actions, after the table's own. */
+  actions?: IOSectionAction[];
   currentView?: "pretty" | "json";
   externalExpansionState?: Record<string, boolean> | boolean;
   onExternalExpansionChange?: (
     expansion: Record<string, boolean> | boolean,
   ) => void;
+  showNullValues?: boolean;
+  stickyTopLevelKey?: boolean;
+  showObservationTypeBadge?: boolean;
+  tone?: PrettyJsonViewTone;
+  /** Rendered inside the section box above the content (e.g. thinking blocks). */
+  beforeContent?: React.ReactNode;
+  /** Rendered inside the section box below the content (e.g. tool calls). */
+  afterContent?: React.ReactNode;
+  /** Initial collapsed state of the section; system prompts use their own rule. */
+  defaultCollapsed?: boolean;
+  /** Controlled collapsed state; long system prompts still follow their rule. */
+  collapsed?: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
+  /** Shows an actions menu instead of the default one-click copy button. */
+  rowActions?: React.ComponentProps<typeof ValueCell>["rowActions"];
+  /** Long system prompts start collapsed (from raw `role === "system"`,
+      since the title can carry a message `name` instead of the role). */
+  isSystemPrompt?: boolean;
 }) {
-  const jsonDependency = useMemo(
-    () =>
-      typeof props.json === "string" ? props.json : JSON.stringify(props.json),
-    [props.json],
-  );
+  const codeClassName = props.codeClassName;
+  // Large plain-string gate (LFE-10991): a multi-MB top-level string skips
+  // deepParseJson's object-only `maxSize` guard, so without this it would run
+  // several full-length main-thread passes (parse, the markdown-probe
+  // `JSON.stringify`, unicode decode — some of them twice, including inside the
+  // always-mounted hidden JSON viewer) and mount the unvirtualized react18-json
+  // tree with the whole string, blocking the tab and inflating memory. The body
+  // renders a bounded preview + download instead.
+  //
+  // Gate on the SETTLED value only. During an async worker parse the parsed
+  // value is not ready (`parsedJson === undefined`, `isParsing` true) and the
+  // raw `json` may be a *stringified* payload whose JSON-quoted form is itself
+  // >2M chars (e.g. the JSON tab passes raw `json` alongside a not-yet-ready
+  // `parsedJson`). Gating on that raw form would flash the fallback — and offer
+  // a quoted-form download — before the parse settles to the real value. The
+  // unvirtualized render we protect against does not run during parse anyway,
+  // so fall through to the normal loading/parsing state in that window.
+  const largeStringValue = useMemo(() => {
+    if (props.isParsing) return null;
+    const settled =
+      props.parsedJson !== undefined ? props.parsedJson : props.json;
+    return isLargeRenderString(settled) ? settled : null;
+  }, [props.parsedJson, props.json, props.isParsing]);
 
+  // Use pre-parsed data if available, otherwise parse on-demand
   const parsedJson = useMemo(() => {
-    return deepParseJson(props.json);
-    // We want to use jsonDependency as dep because it's more stable than props.json
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jsonDependency]);
+    // Skip all parse/decode work on very large plain strings (see gate above);
+    // the raw string is rendered through the bounded fallback, not decoded.
+    if (largeStringValue !== null) {
+      return largeStringValue;
+    }
+
+    // If pre-parsed data is provided, use it directly (skip parsing)
+    if (props.parsedJson !== undefined) {
+      return decodeUnicodeInJson(props.parsedJson);
+    }
+
+    // If still parsing in Web Worker, return null (will show loading state)
+    if (props.isParsing) {
+      return null;
+    }
+
+    // Fast path: if already an object, likely no parsing needed
+    if (typeof props.json !== "string") {
+      return decodeUnicodeInJson(props.json);
+    }
+
+    // Only parse strings, with size/depth limits
+    const result = deepParseJson(props.json, {
+      maxSize: 500_000,
+      maxDepth: 2,
+    });
+
+    // Decode \uXXXX escapes so Python SDK (ensure_ascii=True) traces display
+    // non-ASCII characters correctly in the trace detail view.
+    return decodeUnicodeInJson(result);
+  }, [props.json, props.parsedJson, props.isParsing, largeStringValue]);
+
+  // The section box frames titled tables, toned ones included.
+  const tableBorderless = Boolean(props.title);
+
+  // JSONView internally calls deepParseJson (with maxDepth:3) which mutates
+  // nested string fields in place. Because baseTableData[].rawChildData holds
+  // references back into parsedJson, sharing parsedJson with JSONView would
+  // corrupt the table's lazy-loaded children whenever JSONView renders (even
+  // while hidden via display:none). Pass a deep clone so the two views stay
+  // independent.
+  const jsonViewInput = useMemo(() => {
+    if (parsedJson === null || parsedJson === undefined) return props.json;
+    if (typeof parsedJson !== "object") return parsedJson;
+    return structuredClone(parsedJson);
+  }, [parsedJson, props.json]);
+
   const actualCurrentView = props.currentView ?? "pretty";
   const expandAllRef = useRef<(() => void) | null>(null);
   const [allRowsExpanded, setAllRowsExpanded] = useState(false);
-  const [jsonIsCollapsed, setJsonIsCollapsed] = useState(false);
+
+  // For JSON view: derive collapsed state from external expansion state
+  // false or empty object = collapsed, true or object with keys = expanded
+  const deriveJsonCollapsedFromExternal = useCallback(
+    (extState: Record<string, boolean> | boolean | undefined): boolean => {
+      if (extState === undefined) return false; // default: not collapsed
+      if (extState === false) return true; // explicitly collapsed
+      if (extState === true) return false; // explicitly expanded
+      // empty object = collapsed (user collapsed all)
+      if (typeof extState === "object" && Object.keys(extState).length === 0)
+        return true;
+      return false; // has keys = not collapsed
+    },
+    [],
+  );
+
+  const [jsonIsCollapsed, setJsonIsCollapsed] = useState(() =>
+    deriveJsonCollapsedFromExternal(props.externalExpansionState),
+  );
+
+  // Sync jsonIsCollapsed when external state changes (e.g., navigating between observations)
+  const prevExternalStateRef = useRef(props.externalExpansionState);
+  useEffect(() => {
+    if (prevExternalStateRef.current !== props.externalExpansionState) {
+      const newCollapsed = deriveJsonCollapsedFromExternal(
+        props.externalExpansionState,
+      );
+      prevExternalStateRef.current = props.externalExpansionState;
+      setJsonIsCollapsed(newCollapsed);
+    }
+  }, [props.externalExpansionState, deriveJsonCollapsedFromExternal]);
   const [expandedRowsWithChildren, setExpandedRowsWithChildren] = useState<
     Set<string>
   >(new Set());
@@ -619,14 +837,21 @@ export function PrettyJsonView(props: {
     useState<LangfuseExpandedState>({});
 
   const isChatML = useMemo(() => isChatMLFormat(parsedJson), [parsedJson]);
+  const characterLimit = useMarkdownRenderCharacterLimit();
   const { isMarkdown, content: markdownContent } = useMemo(
-    () => isMarkdownContent(parsedJson),
-    [parsedJson],
+    // Skip the markdown probe for gated large strings: isMarkdownContent runs
+    // `JSON.stringify` on the whole value, an O(n) pass over the multi-MB string.
+    () =>
+      largeStringValue !== null
+        ? { isMarkdown: false as const, content: undefined }
+        : isMarkdownContent(parsedJson, characterLimit),
+    [parsedJson, largeStringValue, characterLimit],
   );
 
   const baseTableData = useMemo(() => {
     try {
       if (
+        largeStringValue === null &&
         actualCurrentView === "pretty" &&
         parsedJson !== null &&
         parsedJson !== undefined &&
@@ -638,7 +863,7 @@ export function PrettyJsonView(props: {
           const topLevelKeys = Object.keys(
             parsedJson as Record<string, unknown>,
           );
-          if (topLevelKeys.length > DEFAULT_MAX_ROWS) {
+          if (topLevelKeys.length > DEFAULT_MAX_ROWS_IF_ROOT) {
             // return empty array to skip expansion directly
             return [];
           }
@@ -674,19 +899,24 @@ export function PrettyJsonView(props: {
           return rows;
         };
 
+        let result: JsonTableRow[];
+
         // top-level is an object, start with its properties directly
         if (parsedJson?.constructor === Object) {
-          return createTopLevelRows(parsedJson as Record<string, unknown>);
+          result = createTopLevelRows(parsedJson as Record<string, unknown>);
+        } else {
+          result = transformJsonToTableData(parsedJson, "", 0, "", true);
         }
 
-        return transformJsonToTableData(parsedJson, "", 0, "", true);
+        return result;
       }
+
       return [];
     } catch (error) {
       console.error("Error transforming JSON to table data:", error);
       return [];
     }
-  }, [parsedJson, isChatML, isMarkdown, actualCurrentView]);
+  }, [parsedJson, isChatML, isMarkdown, actualCurrentView, largeStringValue]);
 
   // state precedence: external state before smart expansion
   const finalExpansionState: ExpandedState = useMemo(() => {
@@ -705,39 +935,37 @@ export function PrettyJsonView(props: {
       props.externalExpansionState !== null &&
       Object.keys(props.externalExpansionState).length > 0
     ) {
-      // user set specific expansions
-      return props.externalExpansionState;
-    }
+      // user set specific expansions - apply with prefix matching
 
-    // No external state -> use smart expansion
-    const optimalLevel = findOptimalExpansionLevel(
-      baseTableData,
-      DEFAULT_MAX_ROWS,
-    );
+      // Extract expanded paths for prefix matching
+      const expandedPaths = Object.entries(props.externalExpansionState)
+        .filter(([, isExpanded]) => isExpanded)
+        .map(([path]) => path);
 
-    if (optimalLevel > 0) {
-      const smartExpanded: ExpandedState = {};
-      const expandRowsToLevel = (
-        rows: JsonTableRow[],
-        currentLevel: number,
-      ) => {
-        rows.forEach((row) => {
-          if (row.hasChildren && currentLevel < optimalLevel) {
-            const keyPath = convertRowIdToKeyPath(row.id);
-            smartExpanded[keyPath] = true;
-
-            const children = getRowChildren(row);
-            if (children.length > 0) {
-              expandRowsToLevel(children, currentLevel + 1);
-            }
-          }
-        });
+      // Apply prefix matching: for each expanded path, expand all its ancestors
+      // Example: if "messages.0.content.text" is expanded, also expand:
+      // "messages", "messages.0", "messages.0.content"
+      const enhancedState: Record<string, boolean> = {
+        ...props.externalExpansionState,
       };
-      expandRowsToLevel(baseTableData, 0);
-      return smartExpanded;
+
+      expandedPaths.forEach((path) => {
+        const parts = path.split(".");
+        // Generate all ancestor paths
+        for (let i = 1; i < parts.length; i++) {
+          const ancestorPath = parts.slice(0, i).join(".");
+          if (enhancedState[ancestorPath] === undefined) {
+            enhancedState[ancestorPath] = true;
+          }
+        }
+      });
+
+      return enhancedState;
     }
 
-    return {};
+    // No external state -> use smart expansion. Short primitive lists stay
+    // collapsed because the parent-row preview already shows their contents.
+    return getSmartExpansionState(baseTableData, DEFAULT_MAX_ROWS);
   }, [baseTableData, props.externalExpansionState]);
 
   // actual expansion state used by the table (combines initial + user changes)
@@ -756,9 +984,8 @@ export function PrettyJsonView(props: {
     } else if (internalExpansionState === false) {
       // user collapsed all
       return false;
-    } else {
-      return finalState;
     }
+    return finalState;
   }, [finalExpansionState, internalExpansionState]);
 
   // table data with lazy-loaded children
@@ -797,8 +1024,14 @@ export function PrettyJsonView(props: {
       });
     };
 
-    return updateRowWithChildren(baseTableData);
-  }, [baseTableData, expandedRowsWithChildren, actualExpansionState]);
+    const dataWithChildren = updateRowWithChildren(baseTableData);
+    return filterTableRows(dataWithChildren, props.showNullValues ?? true);
+  }, [
+    baseTableData,
+    expandedRowsWithChildren,
+    actualExpansionState,
+    props.showNullValues,
+  ]);
 
   const handleLazyLoadChildren = useCallback((rowId: string) => {
     setExpandedRowsWithChildren((prev) => {
@@ -893,7 +1126,7 @@ export function PrettyJsonView(props: {
       event.preventDefault();
     }
     const textToCopy = stringifyJsonNode(parsedJson);
-    void copyTextToClipboard(textToCopy);
+    copyTextToClipboard(textToCopy);
 
     if (event) {
       event.currentTarget.focus();
@@ -901,120 +1134,258 @@ export function PrettyJsonView(props: {
   };
 
   const handleJsonToggleCollapse = () => {
-    setJsonIsCollapsed(!jsonIsCollapsed);
+    const newCollapsed = !jsonIsCollapsed;
+    setJsonIsCollapsed(newCollapsed);
+    if (props.onExternalExpansionChange) {
+      props.onExternalExpansionChange(!newCollapsed);
+    }
   };
 
+  const hasExpandableRows = useMemo(() => {
+    if (typeof parsedJson !== "object" || parsedJson === null) return false;
+    return Object.values(parsedJson as Record<string, unknown>).some((value) =>
+      hasChildren(value, getValueType(value)),
+    );
+  }, [parsedJson]);
   const emptyValueDisplay = getEmptyValueDisplay(parsedJson);
   const isPrettyView = actualCurrentView === "pretty";
   const isMarkdownMode = isMarkdown && isPrettyView;
+  const standaloneMediaReferenceStrings =
+    typeof markdownContent === "string"
+      ? getStandaloneMediaReferenceStrings(markdownContent)
+      : [];
+  const shouldRenderStandaloneMedia =
+    isMarkdownMode && standaloneMediaReferenceStrings.length > 0;
+  const systemPrompt = useCollapsibleSystemPrompt({
+    isSystemPrompt:
+      Boolean(props.title) &&
+      !!props.isSystemPrompt &&
+      isMarkdownMode &&
+      !shouldRenderStandaloneMedia,
+    content: markdownContent ?? "",
+  });
+  const remainingMarkdownMedia = filterAlreadyRenderedMedia(
+    props.media,
+    getRenderedInlineMediaIds({
+      markdown: markdownContent ?? "",
+    }),
+  );
   const shouldUseTableView =
-    isPrettyView && !isChatML && !isMarkdown && !emptyValueDisplay;
-
-  const getBackgroundColorClass = () =>
-    cn(
-      ASSISTANT_TITLES.includes(props.title || "")
-        ? "bg-accent-light-green"
-        : "",
-      SYSTEM_TITLES.includes(props.title || "") ? "bg-primary-foreground" : "",
-    );
+    largeStringValue === null &&
+    isPrettyView &&
+    !isChatML &&
+    !isMarkdown &&
+    !emptyValueDisplay;
 
   const body = (
     <>
-      {emptyValueDisplay && isPrettyView ? (
-        <div
-          className={cn(
-            "flex items-center",
-            getContainerClasses(
-              props.title,
-              props.scrollable,
-              props.codeClassName,
-            ),
-          )}
-        >
-          {props.isLoading ? (
-            <Skeleton className="h-3 w-3/4" />
-          ) : (
+      {largeStringValue !== null ? (
+        <LargeStringFallback title={props.title} value={largeStringValue} />
+      ) : props.isLoading || props.isParsing ? (
+        <div className="io-message-content ph-no-capture">
+          <div
+            className={cn(
+              getContainerClasses(
+                props.scrollable,
+                codeClassName,
+                undefined,
+                tableBorderless,
+              ),
+            )}
+          >
+            <div className="space-y-2">
+              <Skeleton className="h-3 w-3/4" />
+              <Skeleton className="h-3 w-1/2" />
+              <Skeleton className="h-3 w-2/3" />
+              {props.isParsing && (
+                <div className="text-muted-foreground mt-2 text-xs">
+                  Parsing in background...
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : emptyValueDisplay && isPrettyView ? (
+        <div className="io-message-content ph-no-capture">
+          <div
+            className={cn(
+              "flex items-center",
+              getContainerClasses(
+                props.scrollable,
+                codeClassName,
+                undefined,
+                tableBorderless,
+              ),
+            )}
+          >
             <span className={`font-mono ${PREVIEW_TEXT_CLASSES}`}>
               {emptyValueDisplay}
             </span>
-          )}
+          </div>
         </div>
       ) : isMarkdownMode ? (
-        props.isLoading ? (
-          <Skeleton className="h-3 w-3/4" />
-        ) : (
-          <MarkdownView markdown={markdownContent || ""} />
-        )
+        <div className="io-message-content ph-no-capture">
+          {shouldRenderStandaloneMedia ? (
+            standaloneMediaReferenceStrings.map((referenceString, index) => (
+              <LangfuseMediaView
+                key={`${referenceString}-${index}`}
+                mediaReferenceString={referenceString}
+              />
+            ))
+          ) : (
+            <MarkdownView
+              markdown={markdownContent || ""}
+              media={props.media}
+              className={cn(props.title && "p-0")}
+            />
+          )}
+        </div>
       ) : (
         <>
           {/* Always render JsonPrettyTable to preserve internal React Table state */}
           <div
-            className={getContainerClasses(
-              props.title,
-              props.scrollable,
-              props.codeClassName,
-              "flex whitespace-pre-wrap break-words text-xs",
-            )}
+            className="io-message-content ph-no-capture"
             style={{ display: shouldUseTableView ? "flex" : "none" }}
           >
-            {props.isLoading ? (
-              <Skeleton className="m-3 h-3 w-3/4" />
-            ) : (
-              <JsonPrettyTable
-                data={tableData}
-                expandAllRef={expandAllRef}
-                onExpandStateChange={setAllRowsExpanded}
-                noBorder={true}
-                expanded={
-                  actualExpansionState === false ? {} : actualExpansionState
-                }
-                onExpandedChange={handleTableExpandedChange}
-                onLazyLoadChildren={handleLazyLoadChildren}
-                onForceUpdate={handleForceUpdate}
-                smartDefaultsLevel={null}
-                expandedCells={expandedCells}
-                toggleCellExpansion={toggleCellExpansion}
-              />
-            )}
+            <div
+              className={cn(
+                getContainerClasses(
+                  props.scrollable,
+                  codeClassName,
+                  "flex text-xs wrap-break-word whitespace-pre-wrap",
+                  tableBorderless,
+                ),
+                "@container w-full",
+              )}
+            >
+              {props.isLoading ? (
+                <Skeleton className="m-3 h-3 w-3/4" />
+              ) : (
+                <JsonPrettyTable
+                  data={tableData}
+                  expandAllRef={expandAllRef}
+                  onExpandStateChange={setAllRowsExpanded}
+                  noBorder={true}
+                  expanded={
+                    actualExpansionState === false ? {} : actualExpansionState
+                  }
+                  onExpandedChange={handleTableExpandedChange}
+                  onLazyLoadChildren={handleLazyLoadChildren}
+                  onForceUpdate={handleForceUpdate}
+                  smartDefaultsLevel={null}
+                  expandedCells={expandedCells}
+                  toggleCellExpansion={toggleCellExpansion}
+                  stickyTopLevelKey={props.stickyTopLevelKey}
+                  showObservationTypeBadge={props.showObservationTypeBadge}
+                  rowActions={props.rowActions}
+                />
+              )}
+            </div>
           </div>
 
           {/* Always render JSONView to preserve its state too */}
-          <div style={{ display: shouldUseTableView ? "none" : "block" }}>
+          <div
+            className="io-message-content ph-no-capture"
+            style={{ display: shouldUseTableView ? "none" : "block" }}
+          >
             <JSONView
-              json={props.json}
-              title={props.title} // Title value used for background styling
-              hideTitle={true} // But hide the title, we display it
+              // Use the unicode-decoded payload so that \uXXXX escapes from
+              // Python SDK ensure_ascii=True render as original characters.
+              // Pass a clone to avoid JSONView's internal deepParseJson
+              // mutating the shared parsedJson / rawChildData tree.
+              json={jsonViewInput}
               className=""
+              borderless={Boolean(props.title)}
               isLoading={props.isLoading}
-              codeClassName={props.codeClassName}
+              codeClassName={codeClassName}
               collapseStringsAfterLength={props.collapseStringsAfterLength}
               media={props.media}
               scrollable={props.scrollable}
-              projectIdForPromptButtons={props.projectIdForPromptButtons}
               externalJsonCollapsed={jsonIsCollapsed}
               onToggleCollapse={handleJsonToggleCollapse}
             />
           </div>
         </>
       )}
-      {props.media && props.media.length > 0 && (
+      {shouldRenderStandaloneMedia && remainingMarkdownMedia.length > 0 && (
         <>
-          <div className="mx-3 border-t px-2 py-1 text-xs text-muted-foreground">
+          <div className="text-muted-foreground my-1 px-2 py-1 text-xs">
             Media
           </div>
-          <div className="flex flex-wrap gap-2 p-4 pt-1">
-            {props.media.map((m) => (
+          <div className="ph-no-capture flex flex-wrap gap-2 px-2 pt-1 pb-4">
+            {remainingMarkdownMedia.map((m) => (
               <LangfuseMediaView
                 mediaAPIReturnValue={m}
-                asFileIcon={true}
+                variant="icon"
                 key={m.mediaId}
               />
             ))}
           </div>
         </>
       )}
+      {props.media &&
+        props.media.length > 0 &&
+        isPrettyView &&
+        !isMarkdownMode && (
+          <>
+            <div className="text-muted-foreground my-1 px-2 py-1 text-xs">
+              Media
+            </div>
+            <div className="ph-no-capture flex flex-wrap gap-2 px-2 pt-1 pb-4">
+              {props.media.map((m) => (
+                <LangfuseMediaView
+                  mediaAPIReturnValue={m}
+                  variant="icon"
+                  key={m.mediaId}
+                />
+              ))}
+            </div>
+          </>
+        )}
     </>
   );
+
+  const expandAllAction: IOSectionAction | undefined =
+    shouldUseTableView && hasExpandableRows
+      ? {
+          icon: allRowsExpanded ? FoldVertical : UnfoldVertical,
+          label: allRowsExpanded ? "Collapse all rows" : "Expand all rows",
+          onClick: () => expandAllRef.current?.(),
+        }
+      : undefined;
+  const sectionActions = [
+    ...(expandAllAction ? [expandAllAction] : []),
+    ...(props.actions ?? []),
+  ];
+
+  const scrollableBody = props.scrollable ? (
+    <div
+      className={cn(
+        "flex h-full min-h-0 overflow-hidden",
+        isMarkdownMode || (shouldUseTableView && tableBorderless)
+          ? ""
+          : "rounded-sm border",
+      )}
+    >
+      <div className="max-h-full min-h-0 w-full overflow-y-auto">{body}</div>
+    </div>
+  ) : (
+    body
+  );
+
+  if (!props.title) {
+    return (
+      <div
+        className={cn(
+          "flex max-h-full min-h-0 flex-col",
+          props.className,
+          props.scrollable ? "overflow-hidden" : "",
+        )}
+      >
+        {scrollableBody}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -1024,67 +1395,25 @@ export function PrettyJsonView(props: {
         props.scrollable ? "overflow-hidden" : "",
       )}
     >
-      {props.title ? (
-        <MarkdownJsonViewHeader
-          title={props.title}
-          canEnableMarkdown={false}
-          handleOnValueChange={() => {}} // No-op, parent handles state
-          handleOnCopy={handleOnCopy}
-          controlButtons={
-            <>
-              {props.controlButtons}
-              {shouldUseTableView && (
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={() => expandAllRef.current?.()}
-                  className="-mr-2 hover:bg-border"
-                  title={
-                    allRowsExpanded ? "Collapse all rows" : "Expand all rows"
-                  }
-                >
-                  {allRowsExpanded ? (
-                    <FoldVertical className="h-3 w-3" />
-                  ) : (
-                    <UnfoldVertical className="h-3 w-3" />
-                  )}
-                </Button>
-              )}
-              {!isPrettyView && (
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={handleJsonToggleCollapse}
-                  className="-mr-2 hover:bg-border"
-                  title={jsonIsCollapsed ? "Expand all" : "Collapse all"}
-                >
-                  {jsonIsCollapsed ? (
-                    <UnfoldVertical className="h-3 w-3" />
-                  ) : (
-                    <FoldVertical className="h-3 w-3" />
-                  )}
-                </Button>
-              )}
-            </>
-          }
-        />
-      ) : null}
-      {props.scrollable ? (
-        <div
-          className={cn(
-            "flex h-full min-h-0 overflow-hidden",
-            isMarkdownMode ? getBackgroundColorClass() : "rounded-sm border",
-          )}
-        >
-          <div className="max-h-full min-h-0 w-full overflow-y-auto">
-            {body}
-          </div>
-        </div>
-      ) : isMarkdownMode ? (
-        <div className={getBackgroundColorClass()}>{body}</div>
-      ) : (
-        body
-      )}
+      <IOSection
+        title={props.title}
+        titleIcon={props.titleIcon}
+        onCopy={handleOnCopy}
+        actions={sectionActions.length > 0 ? sectionActions : undefined}
+        defaultCollapsed={props.defaultCollapsed}
+        collapsed={props.collapsed}
+        onCollapsedChange={props.onCollapsedChange}
+        variant={shouldUseTableView ? "table" : "text"}
+        tone={props.tone}
+        {...(systemPrompt.shouldBeCollapsible && {
+          collapsed: systemPrompt.isCollapsed,
+          onCollapsedChange: systemPrompt.toggleCollapsed,
+        })}
+      >
+        {props.beforeContent}
+        {scrollableBody}
+        {props.afterContent}
+      </IOSection>
     </div>
   );
 }

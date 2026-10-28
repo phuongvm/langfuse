@@ -1,10 +1,10 @@
 import React from "react";
-import { Button } from "@/src/components/ui/button";
-import { Zap } from "lucide-react";
+import { Button, type ButtonProps } from "@/src/components/ui/button";
+import { Zap } from "@langfuse/icons";
 import { api } from "@/src/utils/api";
-import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
-import { showErrorToast } from "@/src/features/notifications/showErrorToast";
+import { showSuccessToast, showErrorToast } from "@/src/features/notifications";
 import { type SlackChannel } from "./ChannelSelector";
+import { classifyTrpcToastError } from "@/src/utils/trpcErrorClassification";
 
 /**
  * Props for the SlackTestMessageButton component
@@ -17,13 +17,17 @@ interface SlackTestMessageButtonProps {
   /** Whether the button should be disabled */
   disabled?: boolean;
   /** Button variant */
-  variant?: "default" | "outline" | "ghost" | "secondary";
+  variant?: ButtonProps["variant"];
   /** Button size */
-  size?: "default" | "sm" | "lg";
+  size?: ButtonProps["size"];
   /** Custom button text */
   buttonText?: string;
-  /** Callback when test message is sent successfully */
-  onSuccess?: () => void;
+  /** Callback when test message is sent successfully, receives the resolved channel info */
+  onSuccess?: (channelInfo: {
+    id: string;
+    name?: string;
+    isPrivate?: boolean;
+  }) => void;
   /** Callback when test message fails */
   onError?: (error: Error) => void;
   /** Whether to show the button text */
@@ -52,15 +56,20 @@ export const SlackTestMessageButton: React.FC<SlackTestMessageButtonProps> = ({
 }) => {
   // Test message mutation
   const testMessageMutation = api.slack.sendTestMessage.useMutation({
-    onSuccess: () => {
+    onSuccess: (data) => {
       showSuccessToast({
+        operation: "slack.test_message_send",
         title: "Test Message Sent",
         description: "Test message sent successfully to the selected channel.",
       });
-      onSuccess?.();
+      onSuccess?.(data.channelInfo);
     },
     onError: (error) => {
-      showErrorToast("Failed to Send Test Message", error.message);
+      showErrorToast(
+        "Failed to Send Test Message",
+        error.message,
+        classifyTrpcToastError(error, "slack.test_message_send"),
+      );
       onError?.(new Error(error.message));
     },
   });
@@ -73,9 +82,9 @@ export const SlackTestMessageButton: React.FC<SlackTestMessageButtonProps> = ({
       await testMessageMutation.mutateAsync({
         projectId,
         channelId: selectedChannel.id,
-        channelName: selectedChannel.name,
+        channelName: selectedChannel.name ?? undefined,
       });
-    } catch (error) {
+    } catch {
       // Error handling is done in the mutation
     }
   };
@@ -99,7 +108,7 @@ export const SlackTestMessageButton: React.FC<SlackTestMessageButtonProps> = ({
         </>
       ) : (
         <>
-          <Zap className="h-4 w-4" />
+          <Zap size="base" />
           {showText && <span>{buttonText}</span>}
         </>
       )}

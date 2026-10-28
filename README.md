@@ -1,11 +1,8 @@
-<img width="4856" height="1000" alt="github-banner" src="https://github.com/user-attachments/assets/6f435ef3-1194-4e26-87af-aa13826bbb5f" />
+<img width="2400" alt="hero-b (1)" src="https://github.com/user-attachments/assets/5810ae13-15d6-4b60-afd2-927adc501861" />
 
 <div align="center">
    <div>
       <h3>
-        <a href="https://langfuse.com/blog/2025-06-04-open-sourcing-langfuse-product">
-            <strong>Langfuse Is Doubling Down On Open Source</strong>
-         </a> <br> <br>
          <a href="https://cloud.langfuse.com">
             <strong>Langfuse Cloud</strong>
          </a> · 
@@ -25,11 +22,6 @@
       <a href="https://langfuse.com/changelog"><strong>Changelog</strong></a> ·
       <a href="https://langfuse.com/roadmap"><strong>Roadmap</strong></a> ·
    </div>
-   <br/>
-   <span>Langfuse uses <a href="https://github.com/orgs/langfuse/discussions"><strong>GitHub Discussions</strong></a>  for Support and Feature Requests.</span>
-   <br/>
-   <span><b>We're hiring.</b> <a href="https://langfuse.com/careers"><strong>Join us</strong></a> in product engineering and technical go-to-market roles.</span>
-   <br/>
    <br/>
    <div>
    </div>
@@ -70,19 +62,24 @@
 </p>
 
 Langfuse is an **open source LLM engineering** platform. It helps teams collaboratively
-**develop, monitor, evaluate,** and **debug** AI applications. Langfuse can be **self-hosted in minutes** and is **battle-tested**.
+**develop, monitor, evaluate,** and **debug** AI applications. Langfuse can be **self-hosted in minutes** and is **battle-tested**. Proudly made with [ClickHouse open source database](https://github.com/ClickHouse/ClickHouse).
 
-[![Langfuse Overview Video](https://github.com/user-attachments/assets/3926b288-ff61-4b95-8aa1-45d041c70866)](https://langfuse.com/watch-demo)
+> ### 🧑‍💻 We're hiring
+>
+> Langfuse is growing fast (we doubled the team in the last 6 months) - since January 2026 we're part of ClickHouse, we're hiring engineering hybrid across the EU.
+> We hire engineers who love open source and great developer experiences.
+> **[See open roles →](https://langfuse.com/careers?utm_source=github&utm_medium=readme&utm_campaign=hiring&utm_content=langfuse)**
+
 
 ## ✨ Core Features
 
-<img width="4856" height="1944" alt="Langfuse Overview" src="https://github.com/user-attachments/assets/5dac68ef-d546-49fb-b06f-cfafc19282e3" />
+<img width="2400" alt="features" src="https://github.com/user-attachments/assets/0fad3dee-f3ad-423c-9f0d-7ccd0f26cc2d" />
 
 - [LLM Application Observability](https://langfuse.com/docs/tracing): Instrument your app and start ingesting traces to Langfuse, thereby tracking LLM calls and other relevant logic in your app such as retrieval, embedding, or agent actions. Inspect and debug complex logs and user sessions. Try the interactive [demo](https://langfuse.com/docs/demo) to see this in action.
 
 - [Prompt Management](https://langfuse.com/docs/prompt-management/get-started) helps you centrally manage, version control, and collaboratively iterate on your prompts. Thanks to strong caching on server and client side, you can iterate on prompts without adding latency to your application.
 
-- [Evaluations](https://langfuse.com/docs/evaluation/overview) are key to the LLM application development workflow, and Langfuse adapts to your needs. It supports LLM-as-a-judge, user feedback collection, manual labeling, and custom evaluation pipelines via APIs/SDKs.
+- [Evaluations](https://langfuse.com/docs/evaluation/overview) are key to the LLM application development workflow, and Langfuse adapts to your needs. It supports LLM-as-a-judge, Code evaluators, user feedback collection, manual labeling, and custom evaluation pipelines via APIs/SDKs.
 
 - [Datasets](https://langfuse.com/docs/evaluation/dataset-runs/datasets) enable test sets and benchmarks for evaluating your LLM application. They support continuous improvement, pre-deployment testing, structured experiments, flexible evaluation, and seamless integration with frameworks like LangChain and LlamaIndex.
 
@@ -92,7 +89,7 @@ Langfuse is an **open source LLM engineering** platform. It helps teams collabor
 
 ## 📦 Deploy Langfuse
 
-<img width="4856" height="1322" alt="Langfuse Deployment Options" src="https://github.com/user-attachments/assets/98f020c7-7a20-4264-a201-65c41a52a5d5" />
+<img width="2400" alt="deploy" src="https://github.com/user-attachments/assets/cf72e7f8-db7f-4e11-a2a1-ecfbe46f262c" />
 
 ### Langfuse Cloud
 
@@ -100,7 +97,7 @@ Managed deployment by the Langfuse team, generous free-tier, no credit card requ
 
 <div align="center">
     <a href="https://cloud.langfuse.com" target="_blank">
-        <img alt="Static Badge" src="https://img.shields.io/badge/»%20Sign%20up%20for%20Langfuse%20Cloud-8A2BE2?&color=orange">
+        <img alt="Static Badge" src="https://img.shields.io/badge/»%20Sign%20up%20for%20Langfuse%20Cloud-8A2BE2?&color=black">
     </a>
 </div>
 
@@ -112,7 +109,7 @@ Run Langfuse on your own infrastructure:
 
   ```bash
   # Get a copy of the latest Langfuse repository
-  git clone https://github.com/langfuse/langfuse.git
+  git clone --depth=1 https://github.com/langfuse/langfuse.git
   cd langfuse
 
   # Run the langfuse docker compose
@@ -125,9 +122,18 @@ Run Langfuse on your own infrastructure:
 
 See [self-hosting documentation](https://langfuse.com/self-hosting) to learn more about architecture and configuration options.
 
+#### Docker log rotation
+
+The default `docker-compose.yml` inherits the [Docker daemon's logging configuration](https://docs.docker.com/engine/logging/configure/). Docker's default `json-file` driver does not rotate logs unless configured, which can exhaust disk space. Set its [`max-size` and `max-file` options](https://docs.docker.com/engine/logging/drivers/json-file/), or keep your chosen logging backend and configure retention there. Do not rotate or truncate Docker-managed JSON log files with external tools.
+
+After changing daemon logging defaults, restart Docker and recreate existing containers to apply them; restarting containers alone is insufficient. Plan for interruption and preserve data volumes. These settings cover container stdout/stderr, not database data volumes or ClickHouse's internal log files.
+
+> [!TIP]
+> **Self-hosting Langfuse?** Subscribe to the [self-hosting update list](https://langfuse.com/self-hosting#subscribe) to get an email about important features and new releases for open source Langfuse — self-hosting updates only, no marketing.
+
 ## 🔌 Integrations
 
-<img width="4856" height="1322" alt="github-integrations" src="https://github.com/user-attachments/assets/e41ea0fb-742d-41ce-bf94-1d4fb95750cd" />
+<img width="2400" alt="integrations" src="https://github.com/user-attachments/assets/b85c9a45-68f0-4f76-b545-0e8632abef9f" />
 
 ### Main Integrations:
 
@@ -140,6 +146,7 @@ See [self-hosting documentation](https://langfuse.com/self-hosting) to learn mor
 | [Haystack](https://langfuse.com/docs/integrations/haystack)                  | Python                     | Automated instrumentation via Haystack content tracing system.                                                                                   |
 | [LiteLLM](https://langfuse.com/docs/integrations/litellm)                    | Python, JS/TS (proxy only) | Use any LLM as a drop in replacement for GPT. Use Azure, OpenAI, Cohere, Anthropic, Ollama, VLLM, Sagemaker, HuggingFace, Replicate (100+ LLMs). |
 | [Vercel AI SDK](https://langfuse.com/docs/integrations/vercel-ai-sdk)        | JS/TS                      | TypeScript toolkit designed to help developers build AI-powered applications with React, Next.js, Vue, Svelte, Node.js.                          |
+| [Mastra](https://langfuse.com/docs/integrations/mastra)                      | JS/TS                      | Open source framework for building AI agents and multi-agent systems.                                                                            |
 | [API](https://langfuse.com/docs/api)                                         |                            | Directly call the public API. OpenAPI spec available.                                                                                            |
 
 ### Packages integrated with Langfuse:
@@ -189,8 +196,8 @@ pip install langfuse openai
 ```bash filename=".env"
 LANGFUSE_SECRET_KEY="sk-lf-..."
 LANGFUSE_PUBLIC_KEY="pk-lf-..."
-LANGFUSE_HOST="https://cloud.langfuse.com" # 🇪🇺 EU region
-# LANGFUSE_HOST="https://us.cloud.langfuse.com" # 🇺🇸 US region
+LANGFUSE_BASE_URL="https://cloud.langfuse.com" # 🇪🇺 EU region
+# LANGFUSE_BASE_URL="https://us.cloud.langfuse.com" # 🇺🇸 US region
 ```
 
 ```python /@observe()/ /from langfuse.openai import openai/ filename="main.py"
@@ -215,17 +222,9 @@ main()
 
 See your language model calls and other application logic in Langfuse.
 
-<img width="1787" height="674" alt="Example trace in Langfuse" src="https://github.com/user-attachments/assets/f796eb78-dfb5-4570-b236-bdb4b67d4d55" />
+<img width="1600" alt="example-trace-for-github" src="https://github.com/user-attachments/assets/8f6995b7-285f-441a-b52f-1331d13ceb45" />
 
-_[Public example trace in Langfuse](https://cloud.langfuse.com/project/cloramnkj0002jz088vzn1ja4/traces/2cec01e3-3dc2-472f-afcf-3b968cf0c1f4?timestamp=2025-02-10T14%3A27%3A30.275Z&observation=cb5ff844-07ef-41e6-b8e2-6c64344bc13b)_
-
-> [!TIP]
->
-> [Learn more](https://langfuse.com/docs/tracing) about tracing in Langfuse or play with the [interactive demo](https://langfuse.com/docs/demo).
-
-## ⭐️ Star Us
-
-![star-langfuse-on-github](https://github.com/user-attachments/assets/79a1d816-d229-4526-aecc-097d4a19f1ad)
+_[Public example trace in Langfuse](https://cloud.langfuse.com/project/cloramnkj0002jz088vzn1ja4/traces/db22d0a442216b485abd83cc9df6d9ee)_
 
 ## 💭 Support
 
@@ -253,6 +252,10 @@ Your contributions are welcome!
 ## 🥇 License
 
 This repository is MIT licensed, except for the `ee` folders. See [LICENSE](LICENSE) and [docs](https://langfuse.com/docs/open-source) for more details.
+
+## Dependencies
+
+We deploy this code base in Docker containers based on the Linux Alpine Image ([source](https://github.com/nodejs/docker-node)). You may find the Dockerfiles in [web/Dockerfile](web/Dockerfile) and [worker/Dockerfile](worker/Dockerfile).
 
 ## ⭐️ Star History
 
@@ -282,6 +285,7 @@ Top open-source Python projects that use Langfuse, ranked by stars ([Source](htt
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/6154722?s=40&v=4" width="20" height="20" alt=""> &nbsp; [microsoft](https://github.com/microsoft) / [ai-agents-for-beginners](https://github.com/microsoft/ai-agents-for-beginners)                                                      |  38012 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/139558948?s=40&v=4" width="20" height="20" alt=""> &nbsp; [chatchat-space](https://github.com/chatchat-space) / [Langchain-Chatchat](https://github.com/chatchat-space/Langchain-Chatchat)                                               |  36071 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/31035808?s=40&v=4" width="20" height="20" alt=""> &nbsp; [mindsdb](https://github.com/mindsdb) / [mindsdb](https://github.com/mindsdb/mindsdb)                                                                                           |  35669 |
+| <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/169401942?s=40&v=4" width="20" height="20" alt=""> &nbsp; [danny-avila](https://github.com/danny-avila) / [LibreChat](https://github.com/danny-avila/LibreChat)                                                                            |  33142 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/121462774?s=40&v=4" width="20" height="20" alt=""> &nbsp; [BerriAI](https://github.com/BerriAI) / [litellm](https://github.com/BerriAI/litellm)                                                                                          |  28726 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/157326433?s=40&v=4" width="20" height="20" alt=""> &nbsp; [onlook-dev](https://github.com/onlook-dev) / [onlook](https://github.com/onlook-dev/onlook)                                                                                   |  22447 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/487568?s=40&v=4" width="20" height="20" alt=""> &nbsp; [NixOS](https://github.com/NixOS) / [nixpkgs](https://github.com/NixOS/nixpkgs)                                                                                                   |  21748 |
@@ -337,7 +341,6 @@ Top open-source Python projects that use Langfuse, ranked by stars ([Source](htt
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/16997807?s=40&v=4" width="20" height="20" alt=""> &nbsp; [FranciscoMoretti](https://github.com/FranciscoMoretti) / [sparka](https://github.com/FranciscoMoretti/sparka)                                                                  |    380 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/66303003?s=40&v=4" width="20" height="20" alt=""> &nbsp; [RobotecAI](https://github.com/RobotecAI) / [rai](https://github.com/RobotecAI/rai)                                                                                             |    373 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/137044109?s=40&v=4" width="20" height="20" alt=""> &nbsp; [ElectricCodeGuy](https://github.com/ElectricCodeGuy) / [SupabaseAuthWithSSR](https://github.com/ElectricCodeGuy/SupabaseAuthWithSSR)                                          |    370 |
-| <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/169401942?s=40&v=4" width="20" height="20" alt=""> &nbsp; [LibreChat-AI](https://github.com/LibreChat-AI) / [librechat.ai](https://github.com/LibreChat-AI/librechat.ai)                                                                 |    339 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/15125613?s=40&v=4" width="20" height="20" alt=""> &nbsp; [souzatharsis](https://github.com/souzatharsis) / [tamingLLMs](https://github.com/souzatharsis/tamingLLMs)                                                                      |    323 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/8931462?s=40&v=4" width="20" height="20" alt=""> &nbsp; [aws-samples](https://github.com/aws-samples) / [aws-ai-ml-workshop-kr](https://github.com/aws-samples/aws-ai-ml-workshop-kr)                                                    |    295 |
 | <img class="avatar mr-2" src="https://avatars.githubusercontent.com/u/25676773?s=40&v=4" width="20" height="20" alt=""> &nbsp; [weizxfree](https://github.com/weizxfree) / [KnowFlow](https://github.com/weizxfree/KnowFlow)                                                                                   |    285 |
@@ -381,6 +384,9 @@ This helps us to:
 1. Understand how Langfuse is used and improve the most relevant features.
 2. Track overall usage for internal and external (e.g. fundraising) reporting.
 
-None of the data is shared with third parties and does not include any sensitive information. We want to be super transparent about this and you can find the exact data we collect [here](/web/src/features/telemetry/index.ts).
+The telemetry does not include raw traces, prompts, observations, scores, or dataset contents. We document the exact fields that are collected, where they are sent, and the implementation reference in our [telemetry docs](https://langfuse.com/self-hosting/security/telemetry).
 
-You can opt-out by setting `TELEMETRY_ENABLED=false`.
+For Langfuse OSS, you can opt out by setting `TELEMETRY_ENABLED=false`.
+
+<!-- Scarf pixel — cookie-free, privacy-friendly analytics for README views (no cookies, no IP/PII stored). https://docs.scarf.sh/web-traffic/ -->
+<img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=5f9b700f-ee94-4940-b005-e72def008ffa&page=README.md" />

@@ -1,27 +1,22 @@
 import { expect, test, describe, beforeEach, vi, afterEach } from "vitest";
 import { prisma } from "@langfuse/shared/src/db";
 import { randomUUID } from "crypto";
-import { pruneDatabase } from "./utils";
 import { LLMAdapter } from "@langfuse/shared";
 import { encrypt } from "@langfuse/shared/encryption";
 import { createExperimentJobClickhouse } from "../features/experiments/experimentServiceClickhouse";
-import { logger } from "@langfuse/shared/src/server";
-import { callLLM } from "../features/utils/utilities";
-
-// Mock LLM completion call
-vi.mock("../features/utils/utilities", () => ({
-  callLLM: vi.fn().mockResolvedValue({ id: "test-id" }),
-  compileHandlebarString: vi.fn().mockImplementation((str, context) => {
-    // Simple mock that replaces handlebars variables with their values
-    return str.replace(/\{\{(\w+)\}\}/g, (_, key) => context[key] || "");
-  }),
-}));
+import {
+  createDatasetItem,
+  createOrgProjectAndApiKey,
+  generateLLMText,
+  logger,
+} from "@langfuse/shared/src/server";
 
 // Mock the logger to capture log calls
 vi.mock("@langfuse/shared/src/server", async () => {
   const actual = await vi.importActual("@langfuse/shared/src/server");
   return {
     ...actual,
+    generateLLMText: vi.fn().mockResolvedValue({ text: "test output" }),
     logger: {
       info: vi.fn(),
       error: vi.fn(),
@@ -35,7 +30,6 @@ describe("create experiment jobs", () => {
   const mockLogger = vi.mocked(logger);
 
   beforeEach(async () => {
-    await pruneDatabase();
     vi.clearAllMocks();
   });
 
@@ -43,11 +37,10 @@ describe("create experiment jobs", () => {
     vi.restoreAllMocks();
   });
   test("processes valid experiment without throwing", async () => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const promptId = "03f834cc-c089-4bcb-9add-b14cadcdf47c";
-    const datasetItemId = randomUUID();
+    const promptId = randomUUID();
 
     // Create required prompt
     await prisma.prompt.create({
@@ -87,13 +80,10 @@ describe("create experiment jobs", () => {
     });
 
     // Create dataset item
-    await prisma.datasetItem.create({
-      data: {
-        id: datasetItemId,
-        projectId,
-        datasetId,
-        input: { name: "World" },
-      },
+    const res = await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { name: "World" },
     });
     // Create API key
     await prisma.llmApiKeys.create({
@@ -129,10 +119,9 @@ describe("create experiment jobs", () => {
   });
 
   test("handles experiment validation failure (missing prompt_id) without throwing", async () => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const datasetItemId = randomUUID();
 
     // Create dataset
     await prisma.dataset.create({
@@ -159,13 +148,10 @@ describe("create experiment jobs", () => {
     });
 
     // Create dataset item so there's something to create error run items for
-    await prisma.datasetItem.create({
-      data: {
-        id: datasetItemId,
-        projectId,
-        datasetId,
-        input: { name: "World" },
-      },
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { name: "World" },
     });
 
     const payload = {
@@ -187,11 +173,10 @@ describe("create experiment jobs", () => {
   });
 
   test("handles prompt with variables without throwing", async () => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const promptId = "03f834cc-c089-4bcb-9add-b14cadcdf47c";
-    const datasetItemId = randomUUID();
+    const promptId = randomUUID();
 
     // Create dataset
     await prisma.dataset.create({
@@ -232,13 +217,10 @@ describe("create experiment jobs", () => {
     });
 
     // Create dataset item
-    await prisma.datasetItem.create({
-      data: {
-        id: datasetItemId,
-        projectId,
-        datasetId,
-        input: { name: "test" },
-      },
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { name: "test" },
     });
 
     // Create API key
@@ -266,10 +248,10 @@ describe("create experiment jobs", () => {
   });
 
   test("handles mismatched dataset variables without throwing", async () => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const promptId = "03f834cc-c089-4bcb-9add-b14cadcdf47c";
+    const promptId = randomUUID();
     // Create prompt with variable that won't match dataset item
     await prisma.prompt.create({
       data: {
@@ -308,13 +290,10 @@ describe("create experiment jobs", () => {
     });
 
     // Create dataset item with mismatched variables
-    await prisma.datasetItem.create({
-      data: {
-        id: randomUUID(),
-        projectId,
-        datasetId,
-        input: { wrongVariable: "World" }, // doesn't have "name" variable
-      },
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { wrongVariable: "World" }, // doesn't have "name" variable
     });
 
     // Create API key
@@ -345,7 +324,6 @@ describe("create experiment jobs with placeholders", () => {
   const mockLogger = vi.mocked(logger);
 
   beforeEach(async () => {
-    await pruneDatabase();
     vi.clearAllMocks();
   });
 
@@ -353,10 +331,10 @@ describe("create experiment jobs with placeholders", () => {
     promptConfig: any,
     datasetItemInput: any,
   ) => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const promptId = "03f834cc-c089-4bcb-9add-b14cadcdf47c";
+    const promptId = randomUUID();
     // Create prompt
     await prisma.prompt.create({
       data: {
@@ -395,13 +373,10 @@ describe("create experiment jobs with placeholders", () => {
     });
 
     // Create dataset item
-    await prisma.datasetItem.create({
-      data: {
-        id: randomUUID(),
-        projectId,
-        datasetId,
-        input: datasetItemInput,
-      },
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: datasetItemInput,
     });
     // Create API key
     await prisma.llmApiKeys.create({
@@ -501,16 +476,14 @@ describe("create experiment jobs with placeholders", () => {
 
 describe("experiment processing integration", () => {
   beforeEach(async () => {
-    await pruneDatabase();
     vi.clearAllMocks();
   });
 
   test("processes experiment end-to-end without throwing", async () => {
-    const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
+    const { projectId } = await createOrgProjectAndApiKey();
     const datasetId = randomUUID();
     const runId = randomUUID();
-    const promptId = "03f834cc-c089-4bcb-9add-b14cadcdf47c";
-    const datasetItemId = randomUUID();
+    const promptId = randomUUID();
 
     // Create required prompt
     await prisma.prompt.create({
@@ -551,13 +524,10 @@ describe("experiment processing integration", () => {
     });
 
     // Create dataset item
-    await prisma.datasetItem.create({
-      data: {
-        id: datasetItemId,
-        projectId,
-        datasetId,
-        input: { name: "World" },
-      },
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { name: "World" },
     });
 
     // Create API key
@@ -604,5 +574,162 @@ describe("experiment processing integration", () => {
     //     }),
     //   }),
     // );
+  });
+});
+
+describe("experiment prompt tool config", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.mocked(generateLLMText).mockResolvedValue({
+      text: "test output",
+    } as any);
+  });
+
+  const setupExperimentWithPromptConfig = async (
+    promptConfig: unknown,
+    runMetadata: Record<string, unknown> = {},
+  ) => {
+    const { projectId } = await createOrgProjectAndApiKey();
+    const datasetId = randomUUID();
+    const runId = randomUUID();
+    const promptId = randomUUID();
+
+    await prisma.prompt.create({
+      data: {
+        id: promptId,
+        projectId,
+        name: "Test Prompt",
+        prompt: "Hello {{name}}",
+        config: promptConfig as any,
+        type: "text",
+        version: 1,
+        createdBy: "test-user",
+      },
+    });
+    await prisma.dataset.create({
+      data: { id: datasetId, projectId, name: "Test Dataset" },
+    });
+    await prisma.datasetRuns.create({
+      data: {
+        id: runId,
+        name: "Test Run",
+        projectId,
+        datasetId,
+        metadata: {
+          prompt_id: promptId,
+          provider: "openai",
+          model: "gpt-3.5-turbo",
+          model_params: { temperature: 0 },
+          ...runMetadata,
+        },
+      },
+    });
+    await createDatasetItem({
+      projectId,
+      datasetId,
+      input: { name: "World" },
+    });
+    await prisma.llmApiKeys.create({
+      data: {
+        id: randomUUID(),
+        projectId,
+        provider: "openai",
+        adapter: LLMAdapter.OpenAI,
+        displaySecretKey: "test-key",
+        secretKey: encrypt("test-key"),
+      },
+    });
+
+    return { projectId, datasetId, runId };
+  };
+
+  test("passes valid prompt config tools to the LLM call", async () => {
+    const { projectId, datasetId, runId } =
+      await setupExperimentWithPromptConfig({
+        tools: [
+          {
+            name: "get_weather",
+            parameters: {
+              type: "object",
+              properties: { location: { type: "string" } },
+              required: ["location"],
+            },
+          },
+          // OpenAI-wrapped shape must be accepted as well
+          {
+            type: "function",
+            function: {
+              name: "get_time",
+              description: "Get the current time",
+            },
+          },
+        ],
+      });
+
+    const result = await createExperimentJobClickhouse({
+      event: { projectId, datasetId, runId },
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(vi.mocked(generateLLMText)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        maxRetries: 1,
+        tools: expect.objectContaining({
+          get_weather: expect.anything(),
+          get_time: expect.anything(),
+        }),
+      }),
+    );
+  });
+
+  test("ignores invalid prompt config tools and runs without tools", async () => {
+    const { projectId, datasetId, runId } =
+      await setupExperimentWithPromptConfig({
+        tools: [{ name: "broken_tool", parameters: "invalid" }],
+      });
+
+    const result = await createExperimentJobClickhouse({
+      event: { projectId, datasetId, runId },
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(vi.mocked(generateLLMText)).toHaveBeenCalledTimes(1);
+    const callArgs = vi.mocked(generateLLMText).mock.calls[0][0];
+    expect(callArgs.tools).toBeUndefined();
+  });
+
+  test("rejects combining prompt config tools with structured output", async () => {
+    const { projectId, datasetId, runId } =
+      await setupExperimentWithPromptConfig(
+        {
+          tools: [
+            {
+              name: "get_weather",
+              description: "Get the weather for a location",
+              parameters: { type: "object", properties: {} },
+            },
+          ],
+        },
+        {
+          structured_output_schema: {
+            type: "object",
+            properties: { answer: { type: "string" } },
+          },
+        },
+      );
+
+    const result = await createExperimentJobClickhouse({
+      event: { projectId, datasetId, runId },
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(vi.mocked(generateLLMText)).not.toHaveBeenCalled();
+    expect(vi.mocked(logger).error).toHaveBeenCalledWith(
+      "Failed to validate and setup experiment",
+      expect.objectContaining({
+        message:
+          "Your prompt contains tool definitions - tool calls are not compatible with structured output",
+      }),
+    );
   });
 });

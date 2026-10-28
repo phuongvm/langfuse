@@ -1,4 +1,5 @@
-import { z } from "zod/v4";
+/* eslint-disable @typescript-eslint/no-use-before-define */
+import { z } from "zod";
 import {
   ChatMessageType,
   PlaceholderMessageSchema,
@@ -78,7 +79,7 @@ function validateJson(content: string): boolean {
     JSON.parse(content);
 
     return true;
-  } catch (e) {
+  } catch (_e) {
     return false;
   }
 }

@@ -1,19 +1,18 @@
 import { UiColumnMappings } from "../../tableDefinitions";
-import { env } from "../../env";
+import { EvalExecutionMetadataKey } from "../../features/evals/evalExecutionMetadata";
+import { tokenCountFilterClickhouseType } from "./tokenCountFilterType";
 
 export const tracesTableUiColumnDefinitions: UiColumnMappings = [
   {
     uiTableName: "⭐️",
     uiTableId: "bookmarked",
     clickhouseTableName: "traces",
-    clickhouseSelect:
-      env.LANGFUSE_EXPERIMENT_RETURN_NEW_RESULT === "true"
-        ? "finalizeAggregation(t.bookmarked)"
-        : "t.bookmarked",
+    clickhouseSelect: "t.bookmarked",
   },
   {
-    uiTableName: "Level",
+    uiTableName: "Status",
     uiTableId: "level",
+    aliases: ["Level"],
     clickhouseTableName: "observations",
     clickhouseSelect: "aggregated_level",
     queryPrefix: "o",
@@ -25,8 +24,24 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseSelect: "id",
   },
   {
+    uiTableName: "Trace ID",
+    uiTableId: "traceId",
+    clickhouseTableName: "traces",
+    clickhouseSelect: "id",
+  },
+  {
     uiTableName: "Name",
     uiTableId: "name",
+    clickhouseTableName: "traces",
+    clickhouseSelect: "name",
+    queryPrefix: "t",
+  },
+  {
+    // Alias for name - allows traceName filter (used in evals) to work on traces table
+    // this happens in the v4 beta if someone filters for traceName in beta mode and then switches back to non-beta
+    // TODO: remove after beta v4 is concluded
+    uiTableName: "Trace Name",
+    uiTableId: "traceName",
     clickhouseTableName: "traces",
     clickhouseSelect: "name",
     queryPrefix: "t",
@@ -60,6 +75,18 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     queryPrefix: "t",
   },
   {
+    uiTableName: "Evaluator ID",
+    uiTableId: "evaluatorId",
+    clickhouseTableName: "traces",
+    clickhouseSelect: `t.metadata['${EvalExecutionMetadataKey.EVALUATOR_ID}']`,
+  },
+  {
+    uiTableName: "Rule ID",
+    uiTableId: "ruleId",
+    clickhouseTableName: "traces",
+    clickhouseSelect: `if(notEmpty(t.metadata['${EvalExecutionMetadataKey.EVALUATION_RULE_ID}']), t.metadata['${EvalExecutionMetadataKey.EVALUATION_RULE_ID}'], t.metadata['${EvalExecutionMetadataKey.JOB_CONFIGURATION_ID}'])`,
+  },
+  {
     uiTableName: "Version",
     uiTableId: "version",
     clickhouseTableName: "traces",
@@ -83,6 +110,14 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
   {
     uiTableName: "Tags",
     uiTableId: "tags",
+    clickhouseTableName: "traces",
+    clickhouseSelect: "tags",
+    queryPrefix: "t",
+  },
+  {
+    // Alias for tags so canonical traceTags filters work on the traces table too.
+    uiTableName: "Trace Tags",
+    uiTableId: "traceTags",
     clickhouseTableName: "traces",
     clickhouseSelect: "tags",
     queryPrefix: "t",
@@ -121,7 +156,7 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseTableName: "observations",
     clickhouseSelect:
       "arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, o.usage_details)))",
-    clickhouseTypeOverwrite: "Decimal64(3)",
+    clickhouseTypeOverwrite: tokenCountFilterClickhouseType,
   },
   {
     uiTableName: "Output Tokens",
@@ -129,7 +164,7 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseTableName: "observations",
     clickhouseSelect:
       "arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, o.usage_details)))",
-    clickhouseTypeOverwrite: "Decimal64(3)",
+    clickhouseTypeOverwrite: tokenCountFilterClickhouseType,
   },
   {
     uiTableName: "Total Tokens",
@@ -137,7 +172,7 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseTableName: "observations",
     clickhouseSelect:
       "if(mapExists((k, v) -> (k = 'total'), o.usage_details), o.usage_details['total'], NULL)",
-    clickhouseTypeOverwrite: "Decimal64(3)",
+    clickhouseTypeOverwrite: tokenCountFilterClickhouseType,
   },
   {
     uiTableName: "Tokens",
@@ -145,7 +180,7 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseTableName: "observations",
     clickhouseSelect:
       "if(mapExists((k, v) -> (k = 'total'), o.usage_details), o.usage_details['total'], NULL)",
-    clickhouseTypeOverwrite: "Decimal64(3)",
+    clickhouseTypeOverwrite: tokenCountFilterClickhouseType,
   },
   // Scores column duplicated to allow renaming column name. Will be removed once session storage cache is outdated
   // Column names are cached in user sessions - changing them breaks existing filters
@@ -157,15 +192,21 @@ export const tracesTableUiColumnDefinitions: UiColumnMappings = [
   },
   {
     uiTableName: "Scores (numeric)",
-    uiTableId: "scores",
+    uiTableId: "scores_avg",
     clickhouseTableName: "scores",
     clickhouseSelect: "s.scores_avg",
   },
   {
     uiTableName: "Scores (categorical)",
-    uiTableId: "scores",
+    uiTableId: "score_categories",
     clickhouseTableName: "scores",
     clickhouseSelect: "s.score_categories",
+  },
+  {
+    uiTableName: "Scores (boolean)",
+    uiTableId: "score_booleans",
+    clickhouseTableName: "scores",
+    clickhouseSelect: "s.score_booleans",
   },
   {
     uiTableName: "Latency (s)",

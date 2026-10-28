@@ -1,7 +1,13 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 
-import { auditLog } from "@/src/features/audit-logs/auditLog";
-import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { auditLog } from "@/src/features/audit-logs/server";
+import {
+  assertPersistedExportSourceAllowed,
+  resolveExportSource,
+  isPrismaRecordNotFoundError,
+  getDisplayCredential,
+} from "@/src/features/analytics-integrations/server";
+import { throwIfNoProjectAccess } from "@/src/features/rbac";
 import {
   createTRPCRouter,
   protectedProjectProcedure,
@@ -10,6 +16,13 @@ import { decrypt, encrypt } from "@langfuse/shared/encryption";
 import { posthogIntegrationFormSchema } from "@/src/features/posthog-integration/types";
 import { TRPCError } from "@trpc/server";
 import { env } from "@/src/env.mjs";
+import { validateWebhookURL } from "@langfuse/shared/src/server";
+import { areDestinationUrlsEquivalent } from "@/src/features/automations/destinationUrl";
+import {
+  AnalyticsIntegrationExportSource,
+  LangfuseNotFoundError,
+  LEGACY_ANALYTICS_EXPORTER_CUTOFF,
+} from "@langfuse/shared";
 
 export const posthogIntegrationRouter = createTRPCRouter({
   get: protectedProjectProcedure
@@ -20,6 +33,7 @@ export const posthogIntegrationRouter = createTRPCRouter({
         projectId: input.projectId,
         scope: "integrations:CRUD",
       });
+      const writeMode = env.LANGFUSE_MIGRATION_V4_WRITE_MODE;
       try {
         const dbConfig = await ctx.prisma.posthogIntegration.findFirst({
           where: {
@@ -28,14 +42,21 @@ export const posthogIntegrationRouter = createTRPCRouter({
         });
 
         if (!dbConfig) {
-          return null;
+          return { config: null, writeMode };
         }
 
-        const { encryptedPosthogApiKey, ...config } = dbConfig;
+        const { encryptedPosthogApiKey, exportSource, ...config } = dbConfig;
 
+        // Write-only credential: never return the plaintext key (write-only credential).
         return {
-          ...config,
-          posthogApiKey: decrypt(encryptedPosthogApiKey),
+          config: {
+            ...config,
+            exportSource,
+            posthogApiKeyDisplay: getDisplayCredential(
+              decrypt(encryptedPosthogApiKey),
+            ),
+          },
+          writeMode,
         };
       } catch (e) {
         console.error("posthog integration get", e);
@@ -46,7 +67,14 @@ export const posthogIntegrationRouter = createTRPCRouter({
     }),
 
   update: protectedProjectProcedure
-    .input(posthogIntegrationFormSchema.extend({ projectId: z.string() }))
+    .input(
+      posthogIntegrationFormSchema.extend({
+        projectId: z.string(),
+        // Drop the base schema default so an omitted value preserves the
+        // persisted source instead of rewriting it to the legacy default.
+        exportSource: z.enum(AnalyticsIntegrationExportSource).optional(),
+      }),
+    )
     .mutation(async ({ input, ctx }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
@@ -67,59 +95,139 @@ export const posthogIntegrationRouter = createTRPCRouter({
           });
         }
       }
+
+      // Validate PostHog hostname to prevent SSRF attacks
+      try {
+        await validateWebhookURL(input.posthogHostname);
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            error instanceof Error
+              ? `Invalid PostHog hostname: ${error.message}`
+              : "Invalid PostHog hostname",
+        });
+      }
+
+      const existingIntegration =
+        await ctx.prisma.posthogIntegration.findUnique({
+          where: { projectId: input.projectId },
+          select: {
+            exportSource: true,
+            createdAt: true,
+            enabled: true,
+            encryptedPosthogApiKey: true,
+            posthogHostName: true,
+          },
+        });
+
+      // A stored key is only sent to the hostname it was entered for.
+      if (
+        existingIntegration &&
+        !input.posthogProjectApiKey &&
+        !areDestinationUrlsEquivalent(
+          input.posthogHostname,
+          existingIntegration.posthogHostName,
+        )
+      ) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "PostHog Project API Key is required when changing the hostname",
+        });
+      }
+
+      // Write-only credential: blank/omitted keeps the persisted encrypted
+      // value (write-only credential).
+      const encryptedPosthogApiKey = input.posthogProjectApiKey
+        ? encrypt(input.posthogProjectApiKey)
+        : existingIntegration?.encryptedPosthogApiKey;
+      if (!encryptedPosthogApiKey) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "PostHog Project API Key is required",
+        });
+      }
+      const createExportSource = await resolveExportSource({
+        db: ctx.prisma,
+        projectId: input.projectId,
+        requestedExportSource: input.exportSource,
+        existingIntegration,
+        exporterCutoff: LEGACY_ANALYTICS_EXPORTER_CUTOFF,
+      });
+
       await auditLog({
         session: ctx.session,
         action: "update",
         resourceType: "posthogIntegration",
         resourceId: input.projectId,
       });
-      const { posthogProjectApiKey, ...config } = input;
+      const { posthogProjectApiKey: _posthogProjectApiKey, ...config } = input;
 
-      const encryptedPosthogApiKey = encrypt(posthogProjectApiKey);
+      await ctx.prisma.$transaction(async (tx) => {
+        const result = await tx.posthogIntegration.upsert({
+          where: {
+            projectId: input.projectId,
+          },
+          create: {
+            projectId: input.projectId,
+            posthogHostName: config.posthogHostname,
+            encryptedPosthogApiKey,
+            enabled: config.enabled,
+            exportSource: createExportSource,
+          },
+          update: {
+            encryptedPosthogApiKey,
+            posthogHostName: config.posthogHostname,
+            enabled: config.enabled,
+            // undefined → Prisma omits the column → preserves the persisted
+            // value on partial updates.
+            exportSource: config.exportSource,
+            // A re-enabled integration resumes from its old lastSyncAt; the
+            // worker clears the flag once it reaches the live tail. CREATE gets
+            // it from the column default.
+            ...(config.enabled && !existingIntegration?.enabled
+              ? { backfill: true }
+              : {}),
+            // lastError is deliberately left intact so the last fault stays
+            // visible until a successful run clears it.
+          },
+        });
 
-      await ctx.prisma.posthogIntegration.upsert({
-        where: {
-          projectId: input.projectId,
-        },
-        create: {
-          projectId: input.projectId,
-          posthogHostName: config.posthogHostname,
-          encryptedPosthogApiKey,
-          enabled: config.enabled,
-        },
-        update: {
-          encryptedPosthogApiKey,
-          posthogHostName: config.posthogHostname,
-          enabled: config.enabled,
-        },
+        assertPersistedExportSourceAllowed({
+          existingIntegration,
+          result,
+          exporterCutoff: LEGACY_ANALYTICS_EXPORTER_CUTOFF,
+        });
       });
     }),
   delete: protectedProjectProcedure
     .input(z.object({ projectId: z.string() }))
     .mutation(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
-          projectId: input.projectId,
-          scope: "integrations:CRUD",
-        });
-        await auditLog({
-          session: ctx.session,
-          action: "delete",
-          resourceType: "posthogIntegration",
-          resourceId: input.projectId,
-        });
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "integrations:CRUD",
+      });
+      await auditLog({
+        session: ctx.session,
+        action: "delete",
+        resourceType: "posthogIntegration",
+        resourceId: input.projectId,
+      });
 
+      try {
         await ctx.prisma.posthogIntegration.delete({
           where: {
             projectId: input.projectId,
           },
         });
-      } catch (e) {
-        console.log("posthog integration delete", e);
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-        });
+      } catch (error) {
+        if (isPrismaRecordNotFoundError(error)) {
+          throw new LangfuseNotFoundError("PostHog integration not found");
+        }
+
+        throw error;
       }
     }),
 });

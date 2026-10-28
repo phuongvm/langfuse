@@ -1,18 +1,36 @@
-import * as z from "zod/v4";
+import * as z from "zod";
 
-import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
+import { throwIfNoEntitlement } from "@/src/features/entitlements/server";
 
-import { parseDbOrg } from "@langfuse/shared";
 import {
   createTRPCRouter,
   protectedOrganizationProcedure,
 } from "@/src/server/api/trpc";
 import { TRPCError } from "@trpc/server";
-import { throwIfNoOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
-import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { throwIfNoOrganizationAccess } from "@/src/features/rbac";
+import { auditLog } from "@/src/features/audit-logs/server";
 import { logger } from "@langfuse/shared/src/server";
-import { createBillingServiceFromContext } from "./stripeBillingService";
-import { env } from "@/src/env.mjs";
+import { type BillingProvider } from "@langfuse/shared";
+import { resolveBillingService } from "./resolveBillingService";
+import { isCloudBillingEnabled } from "../utils/isCloudBillingEnabled";
+
+const PROVIDER_LABEL: Record<BillingProvider, string> = {
+  stripe: "Stripe",
+  clickhouse: "ClickHouse Billing",
+};
+
+/**
+ * Names the provider that actually failed. Both procedures below can dispatch
+ * to either provider, so a hardcoded "Stripe error:" would point on-call at
+ * the wrong system for a CHB REST failure.
+ */
+const billingErrorMessage = (
+  billingProvider: BillingProvider,
+  error: unknown,
+) => {
+  const label = PROVIDER_LABEL[billingProvider];
+  return `${label} error: ${error instanceof Error ? error.message : `Unknown ${label} error`}`;
+};
 
 export const cloudBillingRouter = createTRPCRouter({
   getSubscriptionInfo: protectedOrganizationProcedure
@@ -34,10 +52,27 @@ export const cloudBillingRouter = createTRPCRouter({
         session: ctx.session,
       });
 
-      const res = await createBillingServiceFromContext(
+      // Return null for non-cloud environments to avoid 500 errors
+      if (!isCloudBillingEnabled()) {
+        logger.info(
+          "cloudBilling.getSubscriptionInfo called in non-cloud environment, returning null",
+          { orgId: input.orgId },
+        );
+        return {
+          cancellation: null,
+          scheduledChange: null,
+          billingPeriod: null,
+          hasValidPaymentMethod: false,
+          billingProvider: "stripe" as const,
+        };
+      }
+
+      const { billingProvider, service } = await resolveBillingService(
         ctx,
-      ).getSubscriptionInfo(input.orgId);
-      return res;
+        input.orgId,
+      );
+      const res = await service.getSubscriptionInfo(input.orgId);
+      return { ...res, billingProvider };
     }),
   createStripeCheckoutSession: protectedOrganizationProcedure
     .input(
@@ -59,13 +94,27 @@ export const cloudBillingRouter = createTRPCRouter({
         orgId: input.orgId,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
-      const url = await stripeBillingService.createCheckoutSession(
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
+
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      // opId is forwarded: the CHB path keys its checkout request on it, so
+      // dropping it would send a concurrent retry to CHB with no idempotency
+      // key and orphan a CH organization. Stripe stays byte-identical because
+      // its createCheckoutSession ignores the argument.
+      const url = await service.createCheckoutSession(
         input.orgId,
         input.stripeProductId,
+        input.opId,
       );
 
-      void auditLog({
+      auditLog({
         session: ctx.session,
         orgId: input.orgId,
         resourceType: "organization",
@@ -95,9 +144,19 @@ export const cloudBillingRouter = createTRPCRouter({
         orgId: input.orgId,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
 
-      await stripeBillingService.changePlan(input.orgId, input.stripeProductId);
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      // opId is intentionally not forwarded: the Stripe path never received
+      // it here, and §4.2 keeps Stripe behavior byte-identical.
+      await service.changePlan(input.orgId, input.stripeProductId);
     }),
   cancelStripeSubscription: protectedOrganizationProcedure
     .input(
@@ -118,9 +177,17 @@ export const cloudBillingRouter = createTRPCRouter({
         orgId: input.orgId,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
 
-      await stripeBillingService.cancel(input.orgId, input.opId);
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      await service.cancel(input.orgId, input.opId);
 
       return { ok: true } as const;
     }),
@@ -143,9 +210,17 @@ export const cloudBillingRouter = createTRPCRouter({
         orgId: input.orgId,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
 
-      await stripeBillingService.reactivate(input.orgId, input.opId);
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      await service.reactivate(input.orgId, input.opId);
 
       return { ok: true } as const;
     }),
@@ -163,12 +238,17 @@ export const cloudBillingRouter = createTRPCRouter({
         orgId: input.orgId,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
 
-      await stripeBillingService.clearPlanSwitchSchedule(
-        input.orgId,
-        input.opId,
-      );
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      await service.clearPlanSwitchSchedule(input.orgId, input.opId);
 
       return { ok: true } as const;
     }),
@@ -191,13 +271,26 @@ export const cloudBillingRouter = createTRPCRouter({
         session: ctx.session,
       });
 
-      try {
-        return await createBillingServiceFromContext(ctx).getCustomerPortalUrl(
-          input.orgId,
+      if (!isCloudBillingEnabled()) {
+        logger.info(
+          "cloudBilling.getStripeCustomerPortalUrl called in non-cloud environment, returning null",
+          { orgId: input.orgId },
         );
+        return null;
+      }
+
+      // Resolved outside the try so the catch can label the failure with the
+      // provider that actually failed. `ChbApiError` extends `Error`, not
+      // `TRPCError`, so a CHB REST failure reaches the wrapper below.
+      let billingProvider: BillingProvider = "stripe";
+      try {
+        const resolved = await resolveBillingService(ctx, input.orgId);
+        billingProvider = resolved.billingProvider;
+        return await resolved.service.getCustomerPortalUrl(input.orgId);
       } catch (error) {
         logger.error("cloudBilling.getStripeCustomerPortalUrl:error", {
           orgId: input.orgId,
+          billingProvider,
           error,
         });
         if (error instanceof TRPCError) {
@@ -205,7 +298,7 @@ export const cloudBillingRouter = createTRPCRouter({
         }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
-          message: `Stripe error: ${error instanceof Error ? error.message : "Unknown Stripe error"}`,
+          message: billingErrorMessage(billingProvider, error),
           cause: error as Error,
         });
       }
@@ -231,18 +324,27 @@ export const cloudBillingRouter = createTRPCRouter({
         session: ctx.session,
       });
 
-      try {
-        return await createBillingServiceFromContext(ctx).getInvoices(
-          input.orgId,
-          {
-            limit: input.limit,
-            startingAfter: input.startingAfter,
-            endingBefore: input.endingBefore,
-          },
+      if (!isCloudBillingEnabled()) {
+        logger.info(
+          "cloudBilling.getInvoices called in non-cloud environment, returning empty",
+          { orgId: input.orgId },
         );
+        return { invoices: [], hasMore: false, cursors: {} };
+      }
+
+      let billingProvider: BillingProvider = "stripe";
+      try {
+        const resolved = await resolveBillingService(ctx, input.orgId);
+        billingProvider = resolved.billingProvider;
+        return await resolved.service.getInvoices(input.orgId, {
+          limit: input.limit,
+          startingAfter: input.startingAfter,
+          endingBefore: input.endingBefore,
+        });
       } catch (error) {
         logger.error("cloudBilling.getInvoices:error", {
           orgId: input.orgId,
+          billingProvider,
           error,
         });
         if (error instanceof TRPCError) {
@@ -250,7 +352,7 @@ export const cloudBillingRouter = createTRPCRouter({
         }
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
-          message: `Stripe error: ${error instanceof Error ? error.message : "Unknown Stripe error"}`,
+          message: billingErrorMessage(billingProvider, error),
           cause: error as Error,
         });
       }
@@ -274,17 +376,18 @@ export const cloudBillingRouter = createTRPCRouter({
         session: ctx.session,
       });
 
-      if (
-        env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION == "DEV" &&
-        !env.STRIPE_SECRET_KEY
-      ) {
-        logger.warn("STRIPE_SECRET_KEY not set, returning 0 usage");
+      // Return null for non-cloud environments to avoid 500 errors
+      if (!isCloudBillingEnabled()) {
+        logger.info(
+          "cloudBilling.getUsage called in non-cloud environment, returning null",
+          { orgId: input.orgId },
+        );
         return null;
       }
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      const { service } = await resolveBillingService(ctx, input.orgId);
 
-      return await stripeBillingService.getUsage(input.orgId);
+      return await service.getUsage(input.orgId);
     }),
   applyPromotionCode: protectedOrganizationProcedure
     .input(
@@ -306,100 +409,22 @@ export const cloudBillingRouter = createTRPCRouter({
         session: ctx.session,
       });
 
-      const stripeBillingService = createBillingServiceFromContext(ctx);
+      if (!isCloudBillingEnabled()) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            "Cloud billing is not available in this environment. This feature requires NEXT_PUBLIC_LANGFUSE_CLOUD_REGION to be configured.",
+        });
+      }
 
-      const result = await stripeBillingService.applyPromotionCode(
+      const { service } = await resolveBillingService(ctx, input.orgId);
+
+      const result = await service.applyPromotionCode(
         input.orgId,
         input.code,
         input.opId,
       );
 
       return result;
-    }),
-  getUsageAlerts: protectedOrganizationProcedure
-    .input(z.object({ orgId: z.string(), opId: z.string().optional() }))
-    .query(async ({ input, ctx }) => {
-      throwIfNoEntitlement({
-        entitlement: "cloud-billing",
-        sessionUser: ctx.session.user,
-        orgId: input.orgId,
-      });
-      throwIfNoOrganizationAccess({
-        organizationId: input.orgId,
-        scope: "langfuseCloudBilling:CRUD",
-        session: ctx.session,
-      });
-
-      const org = await ctx.prisma.organization.findUnique({
-        where: {
-          id: input.orgId,
-        },
-      });
-      if (!org) {
-        throw new TRPCError({
-          code: "NOT_FOUND",
-          message: "Organization not found",
-        });
-      }
-
-      const parsedOrg = parseDbOrg(org);
-      return parsedOrg.cloudConfig?.usageAlerts || null;
-    }),
-  upsertUsageAlerts: protectedOrganizationProcedure
-    .input(
-      z.object({
-        orgId: z.string(),
-        usageAlerts: z.object({
-          enabled: z.boolean(),
-          threshold: z.number().int().positive(),
-          notifications: z.object({
-            email: z.boolean().default(true),
-            recipients: z.array(z.string().email()),
-          }),
-        }),
-      }),
-    )
-    .mutation(async ({ input, ctx }) => {
-      throwIfNoEntitlement({
-        entitlement: "cloud-billing",
-        sessionUser: ctx.session.user,
-        orgId: input.orgId,
-      });
-      throwIfNoOrganizationAccess({
-        organizationId: input.orgId,
-        scope: "langfuseCloudBilling:CRUD",
-        session: ctx.session,
-      });
-
-      try {
-        const orgBefore = await ctx.prisma.organization.findUnique({
-          where: { id: input.orgId },
-        });
-        const updatedAlerts = await createBillingServiceFromContext(
-          ctx,
-        ).upsertUsageAlerts(input.orgId, input.usageAlerts);
-        const orgAfter = await ctx.prisma.organization.findUnique({
-          where: { id: input.orgId },
-        });
-        void auditLog({
-          session: ctx.session,
-          orgId: input.orgId,
-          resourceType: "organization",
-          resourceId: input.orgId,
-          action: "updateUsageAlerts",
-          before: orgBefore!,
-          after: orgAfter!,
-        });
-        return updatedAlerts;
-      } catch (error) {
-        logger.error("Failed to update usage alerts", {
-          error,
-          orgId: input.orgId,
-        });
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Failed to update usage alerts",
-        });
-      }
     }),
 });

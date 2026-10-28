@@ -1,32 +1,69 @@
 import {
+  commandClickhouse,
+  deleteEventsByTraceIds,
   deleteObservationsByTraceIds,
   deleteScoresByTraceIds,
   deleteTraces,
+  getS3MediaStorageClient,
   logger,
+  queryClickhouse,
   removeIngestionEventsFromS3AndDeleteClickhouseRefsForTraces,
-  StorageService,
-  StorageServiceFactory,
   traceException,
 } from "@langfuse/shared/src/server";
-import { env } from "../../env";
-import { prisma } from "@langfuse/shared/src/db";
+import { env, v4WritesToEventsTable } from "../../env";
+import { Prisma, prisma } from "@langfuse/shared/src/db";
+import { env as sharedEnv } from "@langfuse/shared/src/env";
+import { chunk } from "lodash";
 
-let s3MediaStorageClient: StorageService;
+const deleteTopicResultsForTraces = async (
+  projectId: string,
+  traceIds: string[],
+): Promise<void> => {
+  if (!traceIds.length) return;
 
-const getS3MediaStorageClient = (bucketName: string): StorageService => {
-  if (!s3MediaStorageClient) {
-    s3MediaStorageClient = StorageServiceFactory.getInstance({
-      bucketName,
-      accessKeyId: env.LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID,
-      secretAccessKey: env.LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY,
-      endpoint: env.LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT,
-      region: env.LANGFUSE_S3_MEDIA_UPLOAD_REGION,
-      forcePathStyle: env.LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE === "true",
-      awsSse: env.LANGFUSE_S3_MEDIA_UPLOAD_SSE,
-      awsSseKmsKeyId: env.LANGFUSE_S3_MEDIA_UPLOAD_SSE_KMS_KEY_ID,
-    });
-  }
-  return s3MediaStorageClient;
+  await Promise.all(
+    ["topic_facet_summaries", "topic_assignments"].map(async (table) => {
+      const params = { projectId, traceIds };
+      const clickhouseConfigs = {
+        request_timeout: sharedEnv.LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS,
+      };
+      const [bounds] = await queryClickhouse<{
+        min_timestamp: string;
+        max_timestamp: string;
+        count: string;
+      }>({
+        query: `SELECT min(unit_start_time) AS min_timestamp,
+            max(unit_start_time) AS max_timestamp, count() AS count
+          FROM ${table}
+          WHERE project_id = {projectId: String}
+            AND trace_id IN ({traceIds: Array(String)})`,
+        params,
+        clickhouseConfigs,
+        tags: { projectId },
+      });
+      if (Number(bounds?.count ?? 0) === 0) return;
+
+      await commandClickhouse({
+        query: `DELETE FROM ${table}
+          WHERE project_id = {projectId: String}
+            AND trace_id IN ({traceIds: Array(String)})
+            AND unit_start_time >= {minTimestamp: DateTime64(3)}
+            AND unit_start_time <= {maxTimestamp: DateTime64(3)}`,
+        params: {
+          ...params,
+          minTimestamp: bounds.min_timestamp,
+          maxTimestamp: bounds.max_timestamp,
+        },
+        clickhouseConfigs,
+        // Patch parts disable the summary projection until they are materialized.
+        clickhouseSettings:
+          table === "topic_facet_summaries"
+            ? { lightweight_delete_mode: "alter_update" }
+            : undefined,
+        tags: { projectId },
+      });
+    }),
+  );
 };
 
 const deleteMediaItemsForTraces = async (
@@ -36,11 +73,12 @@ const deleteMediaItemsForTraces = async (
   if (!env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET) {
     return;
   }
-  // First, find all records associated with the traces to be deleted
+
+  // Phase 1: Find and delete references, collect affected mediaIds
+  const allMediaIds = new Set<string>();
   const [traceMediaItems, observationMediaItems] = await Promise.all([
     prisma.traceMedia.findMany({
       select: {
-        id: true,
         mediaId: true,
       },
       where: {
@@ -52,7 +90,6 @@ const deleteMediaItemsForTraces = async (
     }),
     prisma.observationMedia.findMany({
       select: {
-        id: true,
         mediaId: true,
       },
       where: {
@@ -64,73 +101,120 @@ const deleteMediaItemsForTraces = async (
     }),
   ]);
 
-  // Find media items that will have no remaining references after deletion
-  const mediaDeleteCandidates = await prisma.media.findMany({
-    select: {
-      id: true,
-      bucketPath: true,
-    },
-    where: {
-      projectId,
-      id: {
-        in: [...traceMediaItems, ...observationMediaItems].map(
-          (ref) => ref.mediaId,
-        ),
-      },
-      TraceMedia: {
-        every: {
-          id: {
-            in: traceMediaItems.map((ref) => ref.id),
-          },
-        },
-      },
-      ObservationMedia: {
-        every: {
-          id: {
-            in: observationMediaItems.map((ref) => ref.id),
-          },
-        },
-      },
-    },
-  });
+  // Collect all affected mediaIds
+  traceMediaItems.forEach((item) => allMediaIds.add(item.mediaId));
+  observationMediaItems.forEach((item) => allMediaIds.add(item.mediaId));
 
-  // Remove the media items that will have no remaining references
-  if (mediaDeleteCandidates.length > 0) {
-    // Delete from Cloud Storage
-    await getS3MediaStorageClient(
-      env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET ?? "", // Fallback is never used.
-    ).deleteFiles(mediaDeleteCandidates.map((f) => f.bucketPath));
-
-    // Delete from postgres
-    await prisma.media.deleteMany({
-      where: {
-        id: {
-          in: mediaDeleteCandidates.map((f) => f.id),
-        },
-        projectId,
-      },
-    });
+  // Phase 2: Delete orphaned media items using NOT EXISTS subquery
+  if (allMediaIds.size === 0) {
+    return;
   }
 
-  // Remove all traceMedia and observationMedia items that we found earlier
-  await Promise.all([
-    prisma.traceMedia.deleteMany({
+  const mediaIdChunks = chunk(Array.from(allMediaIds), 1000);
+  const s3DeletedMediaIds: string[] = [];
+
+  for (const mediaIdChunk of mediaIdChunks) {
+    // Delete S3 before Postgres so a storage failure leaves trace links for
+    // retry discovery. Re-check orphan guards after deleting the trace links.
+    const orphanedMedia = await prisma.$queryRaw<
+      { id: string; bucketPath: string }[]
+    >`
+      SELECT m.id, m.bucket_path AS "bucketPath"
+      FROM media m
+      WHERE
+        m.project_id = ${projectId}
+        AND m.id IN (${Prisma.join(mediaIdChunk)})
+        AND NOT EXISTS (
+          SELECT 1
+          FROM trace_media tm
+          WHERE tm.project_id = m.project_id
+            AND tm.media_id = m.id
+            AND tm.trace_id NOT IN (${Prisma.join(traceIds)})
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM observation_media om
+          WHERE om.project_id = m.project_id
+            AND om.media_id = m.id
+            AND om.trace_id NOT IN (${Prisma.join(traceIds)})
+        )
+        -- Only a claimed association (validFrom set) protects media; pending
+        -- rows (null validFrom) are sweepable, matching deleteMediaFiles.
+        AND NOT EXISTS (
+          SELECT 1
+          FROM dataset_item_media dim
+          WHERE dim.project_id = m.project_id
+            AND dim.media_id = m.id
+            AND dim.dataset_item_valid_from IS NOT NULL
+        )
+    `;
+
+    if (orphanedMedia.length > 0) {
+      await getS3MediaStorageClient(
+        env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET ?? "", // Fallback is never used.
+      ).deleteFiles(orphanedMedia.map((f) => f.bucketPath));
+
+      s3DeletedMediaIds.push(...orphanedMedia.map((m) => m.id));
+    }
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.traceMedia.deleteMany({
       where: {
         projectId,
-        id: {
-          in: traceMediaItems.map((ref) => ref.id),
+        traceId: {
+          in: traceIds,
         },
       },
-    }),
-    prisma.observationMedia.deleteMany({
+    });
+
+    await tx.observationMedia.deleteMany({
       where: {
         projectId,
-        id: {
-          in: observationMediaItems.map((ref) => ref.id),
+        traceId: {
+          in: traceIds,
         },
       },
-    }),
-  ]);
+    });
+
+    if (s3DeletedMediaIds.length > 0) {
+      // Sweep leftover pending rows for the deleted media (claimed rows can't
+      // exist for deletable media), matching deleteMediaFiles.
+      await tx.datasetItemMedia.deleteMany({
+        where: {
+          projectId,
+          mediaId: { in: s3DeletedMediaIds },
+          datasetItemValidFrom: null,
+        },
+      });
+
+      await tx.$executeRaw`
+        DELETE FROM media m
+        WHERE
+          m.project_id = ${projectId}
+          AND m.id IN (${Prisma.join(s3DeletedMediaIds)})
+          AND NOT EXISTS (
+            SELECT 1
+            FROM trace_media tm
+            WHERE tm.project_id = m.project_id
+              AND tm.media_id = m.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM observation_media om
+            WHERE om.project_id = m.project_id
+              AND om.media_id = m.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM dataset_item_media dim
+            WHERE dim.project_id = m.project_id
+              AND dim.media_id = m.id
+              AND dim.dataset_item_valid_from IS NOT NULL
+          )
+      `;
+    }
+  });
 };
 
 export const processClickhouseTraceDelete = async (
@@ -149,11 +233,16 @@ export const processClickhouseTraceDelete = async (
         ? removeIngestionEventsFromS3AndDeleteClickhouseRefsForTraces({
             projectId,
             traceIds,
+            includeEventsTable: v4WritesToEventsTable(env),
           })
         : Promise.resolve(),
       deleteTraces(projectId, traceIds),
       deleteObservationsByTraceIds(projectId, traceIds),
       deleteScoresByTraceIds(projectId, traceIds),
+      deleteTopicResultsForTraces(projectId, traceIds),
+      v4WritesToEventsTable(env)
+        ? deleteEventsByTraceIds(projectId, traceIds)
+        : Promise.resolve(),
     ]);
   } catch (e) {
     logger.error(

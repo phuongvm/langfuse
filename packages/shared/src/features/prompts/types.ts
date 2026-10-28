@@ -1,7 +1,21 @@
-import { z } from "zod/v4";
-import type { Prompt } from "../../../prisma/generated/types";
-import { jsonSchema } from "../../utils/zod";
-import { COMMIT_MESSAGE_MAX_LENGTH } from "./constants";
+import { z } from "zod";
+import type { Prompt } from "@prisma/client";
+import { isoDateTime, jsonSchema, optionalJsonParam } from "../../utils/zod";
+import {
+  arrayOptionsFilter,
+  coerceLegacyEmptyMetadataFilters,
+  numberFilter,
+  stringFilter,
+  stringObjectFilter,
+  stringOptionsFilter,
+  timeFilter,
+} from "../../interfaces/filters";
+import {
+  COMMIT_MESSAGE_MAX_LENGTH,
+  PROMPT_LABEL_MAX_LENGTH,
+  PROMPT_LABEL_REGEX,
+  PROMPT_LABEL_REGEX_ERROR,
+} from "./constants";
 import { PromptChatMessageSchema } from "../../server/llm/types";
 import { PromptNameSchema } from "./validation";
 
@@ -9,20 +23,16 @@ export const SingleChatMessageSchema = PromptChatMessageSchema;
 export type SingleChatMessage = z.infer<typeof SingleChatMessageSchema>;
 
 export enum PromptType {
-  // eslint-disable-next-line no-unused-vars
   Chat = "chat",
-  // eslint-disable-next-line no-unused-vars
+
   Text = "text",
 }
 
 export const PromptLabelSchema = z
   .string()
   .min(1)
-  .max(36)
-  .regex(
-    /^[a-z0-9_\-.]+$/,
-    "Label must be lowercase alphanumeric with optional underscores, hyphens, or periods",
-  );
+  .max(PROMPT_LABEL_MAX_LENGTH)
+  .regex(PROMPT_LABEL_REGEX, PROMPT_LABEL_REGEX_ERROR);
 
 const BaseCreateTextPromptSchema = z.object({
   name: PromptNameSchema,
@@ -75,6 +85,25 @@ export const CreatePromptTRPCSchema = z.union([
 
 export type CreatePromptTRPCType = z.infer<typeof CreatePromptTRPCSchema>;
 
+const promptFilterSchema = z.preprocess(
+  coerceLegacyEmptyMetadataFilters,
+  z.array(
+    z.discriminatedUnion("type", [
+      stringFilter.extend({ column: z.enum(["id", "name", "type"]) }),
+      stringOptionsFilter.safeExtend({
+        column: z.enum(["id", "name", "type"]),
+      }),
+      numberFilter.extend({ column: z.literal("version") }),
+      timeFilter.extend({ column: z.enum(["createdAt", "updatedAt"]) }),
+      arrayOptionsFilter.safeExtend({
+        column: z.enum(["labels", "tags"]),
+        value: z.array(z.string()).min(1),
+      }),
+      stringObjectFilter.extend({ column: z.literal("config") }),
+    ]),
+  ),
+);
+
 export const GetPromptsMetaSchema = z.object({
   name: z.string().optional(),
   version: z.coerce.number().int().nullish(),
@@ -82,8 +111,9 @@ export const GetPromptsMetaSchema = z.object({
   tag: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(10),
-  fromUpdatedAt: z.string().datetime({ offset: true }).nullish(),
-  toUpdatedAt: z.string().datetime({ offset: true }).nullish(),
+  fromUpdatedAt: isoDateTime({ offset: true }).nullish(),
+  toUpdatedAt: isoDateTime({ offset: true }).nullish(),
+  filter: optionalJsonParam(promptFilterSchema, "filter"),
 });
 
 export type GetPromptsMetaType = z.infer<typeof GetPromptsMetaSchema>;
@@ -97,6 +127,11 @@ export const GetPromptByNameSchema = z.object({
   promptName: z.string(),
   version: z.coerce.number().int().nullish(),
   label: z.string().optional(),
+  resolve: z
+    .enum(["true", "false"])
+    .nullish()
+    .default("true")
+    .transform((v) => v === "true"), // Optional, defaults to true for backward compatibility
 });
 
 const BaseTextPromptSchema = z.object({

@@ -1,18 +1,24 @@
+/* eslint-disable no-nested-ternary */
 // Langfuse Cloud only
 
+import { useHasOrganizationAccess } from "@/src/features/rbac";
 import Header from "@/src/components/layouts/header";
-import { useHasEntitlement } from "@/src/features/entitlements/hooks";
+import { useHasEntitlement } from "@/src/features/entitlements";
 import { useRouter } from "next/router";
-import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
-import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
+import { Alert } from "@/src/components/design-system/Alert/Alert";
 
-import { UsageAlerts } from "./UsageAlerts";
 import { BillingUsageChart } from "./BillingUsageChart";
 import { BillingActionButtons } from "./BillingActionButtons";
 import { BillingScheduleNotification } from "./BillingScheduleNotification";
-import { BillingInvoiceTable } from "./BillingInvoiceTable";
+import { ConnectedBillingInvoiceTable } from "./ConnectedBillingInvoiceTable";
 import { BillingDiscountView } from "./BillingDiscountView";
 import { BillingPlanPeriodView } from "@/src/ee/features/billing/components/BillingPlanPeriodView";
+import { useIsCloudBillingAvailable } from "@/src/ee/features/billing/utils/isCloudBilling";
+import { SpendAlertsSection } from "./SpendAlerts/SpendAlertsSection";
+import { useBillingInformation } from "./useBillingInformation";
+import { api } from "@/src/utils/api";
+import { OrganizationUsageBreakdown } from "@/src/features/organization-usage";
+import { MAX_EVENTS_FREE_PLAN } from "@/src/ee/features/billing/constants";
 
 export const BillingSettings = () => {
   const router = useRouter();
@@ -22,34 +28,98 @@ export const BillingSettings = () => {
     scope: "langfuseCloudBilling:CRUD",
   });
 
-  const entitled = useHasEntitlement("cloud-billing");
-  const isUsageAlertEntitled = useHasEntitlement("cloud-usage-alerts");
+  const isCloudBillingAvailable = useIsCloudBillingAvailable();
+  const isCloudBillingEntitled = useHasEntitlement("cloud-billing");
+  const isSpendAlertEntitled = useHasEntitlement("cloud-spend-alerts");
+  const {
+    organization,
+    billingProvider,
+    hasActiveSubscription,
+    planLabel,
+    cancellation,
+    scheduledPlanSwitch,
+  } = useBillingInformation();
+  const usage = api.cloudBilling.getUsage.useQuery(
+    { orgId: organization?.id ?? "" },
+    {
+      enabled: Boolean(
+        organization &&
+        isCloudBillingAvailable &&
+        isCloudBillingEntitled &&
+        hasAccess,
+      ),
+      trpc: {
+        context: {
+          skipBatch: true,
+        },
+      },
+    },
+  );
+  const showBillingDiscount = Boolean(
+    organization?.cloudConfig?.stripe?.activeSubscriptionId &&
+    billingProvider !== "clickhouse",
+  );
 
-  if (!entitled) return null;
-
-  if (!hasAccess)
+  if (!hasAccess) {
     return (
       <Alert>
-        <AlertTitle>Access Denied</AlertTitle>
-        <AlertDescription>
+        <Alert.Title>Access Denied</Alert.Title>
+        <Alert.Description>
           You do not have permission to view the billing settings of this
           organization.
-        </AlertDescription>
+        </Alert.Description>
       </Alert>
     );
+  }
 
   return (
     <div>
-      <BillingScheduleNotification />
+      {cancellation ? (
+        <BillingScheduleNotification
+          type="cancellation"
+          planLabel={planLabel}
+          cancellation={cancellation}
+        />
+      ) : scheduledPlanSwitch ? (
+        <BillingScheduleNotification
+          type="scheduled-plan-switch"
+          planLabel={planLabel}
+          scheduledPlanSwitch={scheduledPlanSwitch}
+        />
+      ) : null}
 
       <Header title="Usage & Billing" />
       <div className="space-y-6">
-        <BillingUsageChart />
+        {usage.data !== null && (
+          <BillingUsageChart
+            usage={usage.data}
+            hobbyPlanLimit={
+              organization?.cloudConfig?.monthlyObservationLimit ??
+              MAX_EVENTS_FREE_PLAN
+            }
+            plan={organization?.plan ?? "cloud:hobby"}
+          />
+        )}
+        {organization && <OrganizationUsageBreakdown orgId={organization.id} />}
         <BillingPlanPeriodView />
-        <BillingDiscountView />
+        {showBillingDiscount && organization && (
+          <BillingDiscountView
+            orgId={organization.id}
+            hasStripeCustomer={Boolean(
+              organization.cloudConfig?.stripe?.customerId,
+            )}
+          />
+        )}
         <BillingActionButtons />
-        {isUsageAlertEntitled && orgId && <UsageAlerts orgId={orgId} />}
-        <BillingInvoiceTable />
+        {isCloudBillingAvailable &&
+          organization &&
+          Boolean(
+            organization.cloudConfig?.stripe?.customerId ??
+            organization.cloudConfig?.clickhouse?.organizationId,
+          ) && <ConnectedBillingInvoiceTable key={organization.id} />}
+        {isSpendAlertEntitled && orgId && hasActiveSubscription && (
+          <SpendAlertsSection orgId={orgId} />
+        )}
       </div>
     </div>
   );

@@ -1,35 +1,44 @@
+/* eslint-disable @repo/no-style-props */
 import { DashboardCard } from "@/src/features/dashboard/components/cards/DashboardCard";
 import { DashboardTable } from "@/src/features/dashboard/components/cards/DashboardTable";
 import {
-  type ScoreDataType,
+  type ScoreDataTypeType,
   type ScoreSourceType,
   type FilterState,
 } from "@langfuse/shared";
+import { type ViewVersion } from "@langfuse/shared/query";
 import { api } from "@/src/utils/api";
 import { compactNumberFormatter } from "@/src/utils/numbers";
 import { RightAlignedCell } from "./RightAlignedCell";
 import { LeftAlignedCell } from "@/src/features/dashboard/components/LeftAlignedCell";
+import { cn } from "@/src/utils/tailwind";
 import { TotalMetric } from "./TotalMetric";
 import { createTracesTimeFilter } from "@/src/features/dashboard/lib/dashboard-utils";
-import { getScoreDataTypeIcon } from "@/src/features/scores/lib/scoreColumns";
-import { isCategoricalDataType } from "@/src/features/scores/lib/helpers";
+import {
+  getScoreDataTypeIcon,
+  isBooleanDataType,
+  isCategoricalDataType,
+  isNumericDataType,
+} from "@/src/features/scores";
 import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
 import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
 
 const dropValuesForCategoricalScores = (
   value: number,
-  scoreDataType: ScoreDataType,
+  scoreDataType: ScoreDataTypeType,
 ): string => {
-  return isCategoricalDataType(scoreDataType)
-    ? "-"
-    : compactNumberFormatter(value);
+  if (isCategoricalDataType(scoreDataType)) return "-";
+  if (isBooleanDataType(scoreDataType) || isNumericDataType(scoreDataType)) {
+    return compactNumberFormatter(value);
+  }
+  return "-";
 };
 
 const scoreNameSourceDataTypeMatch =
   (
     scoreName: string,
     scoreSource: ScoreSourceType,
-    scoreDataType: ScoreDataType,
+    scoreDataType: ScoreDataTypeType,
   ) =>
   (item: DatabaseRow) =>
     item.scoreName === scoreName &&
@@ -41,11 +50,13 @@ export const ScoresTable = ({
   projectId,
   globalFilterState,
   isLoading = false,
+  metricsVersion,
 }: {
   className: string;
   projectId: string;
   globalFilterState: FilterState;
   isLoading?: boolean;
+  metricsVersion: ViewVersion;
 }) => {
   const localFilters = createTracesTimeFilter(
     globalFilterState,
@@ -77,6 +88,7 @@ export const ScoresTable = ({
       ],
       orderBy: [{ column: "scoreId", direction: "DESC", agg: "COUNT" }],
       queryName: "score-aggregate",
+      version: metricsVersion,
     },
     {
       trpc: {
@@ -121,6 +133,7 @@ export const ScoresTable = ({
         ],
         orderBy: [{ column: "scoreId", direction: "DESC", agg: "COUNT" }],
         queryName: "score-aggregate",
+        version: metricsVersion,
       },
       {
         trpc: {
@@ -135,7 +148,7 @@ export const ScoresTable = ({
 
   if (!zeroValueScores || !oneValueScores) {
     return (
-      <DashboardCard title={"Scores"} isLoading={false}>
+      <DashboardCard title="Scores" isLoading={false}>
         <NoDataOrLoading isLoading={false} />
       </DashboardCard>
     );
@@ -148,7 +161,7 @@ export const ScoresTable = ({
     return metrics.data.map((metric) => {
       const scoreName = metric.scoreName as string;
       const scoreSource = metric.scoreSource as ScoreSourceType;
-      const scoreDataType = metric.scoreDataType as ScoreDataType;
+      const scoreDataType = metric.scoreDataType as ScoreDataTypeType;
 
       const zeroValueScore = zeroValueScores.data.find(
         scoreNameSourceDataTypeMatch(scoreName, scoreSource, scoreDataType),
@@ -182,7 +195,11 @@ export const ScoresTable = ({
 
   return (
     <DashboardCard
-      className={className}
+      // h-full pins the card to the tile so the table fits its rows to the
+      // AVAILABLE height instead of overflowing; min-h-0 lets the flex column
+      // shrink so the row area scrolls internally. (LFE-11035)
+      className={cn(className, "h-full")}
+      cardContentClassName="min-h-0"
       title="Scores"
       isLoading={
         isLoading ||
